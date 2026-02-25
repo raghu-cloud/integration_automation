@@ -26,29 +26,25 @@ logger = logging.getLogger(__name__)
 
 MAX_HEAL_ROUNDS = 3
 
-# Project-level test files (fallback when repo has no tests/ dir)
-_PROJECT_TEST_FILES: dict[str, str] = {
-    "crewai": "tests/test_crewai_integration.py",
-    "langchain": "tests/test_langchain_integration.py",
-    "llamaindex": "tests/test_llamaindex_integration.py",
-}
-
-
-def _get_test_path(client: str, base_dir: str) -> tuple[str, str]:
+def _get_test_path(client: str, base_dir: str) -> tuple[str, str] | tuple[None, None]:
     """
-    Find the test file/dir and the working directory to run pytest in.
+    Find the test directory inside the framework's cloned repo.
 
-    Returns (test_target, cwd) where:
-      - test_target: path to pass to pytest (file or directory)
-      - cwd: working directory for the subprocess
+    Only runs tests from the framework repos (crewai/tests/, langchain/tests/,
+    llamaindex/tests/). Never falls back to integration_automation/tests/.
+
+    Returns (test_target, cwd) or (None, None) if no tests dir found.
     """
     repo_root = get_repo_root(client)
     repo_tests = repo_root / "tests"
     if repo_tests.exists():
         return str(repo_tests), str(repo_root)
 
-    # Fall back to project-level test file
-    return _PROJECT_TEST_FILES.get(client, f"tests/test_{client}_integration.py"), base_dir
+    logger.warning(
+        "[test_heal][%s] No tests/ directory found in repo at %s — skipping.",
+        client, repo_root,
+    )
+    return None, None
 
 
 # ── Multi-file heal prompt ─────────────────────────────────────────────────
@@ -180,6 +176,20 @@ def _heal(client: str, test_output: str, base_dir: str) -> None:
 def _test_and_heal_one(client: str, base_dir: str = ".") -> dict:
     """Run test → heal loop for a single client."""
     test_target, cwd = _get_test_path(client, base_dir)
+
+    # Skip if no tests/ directory exists in the framework repo
+    if test_target is None:
+        return {
+            "client": client,
+            "passed": False,
+            "rounds_used": 0,
+            "summary": "skipped — no tests/ directory in repo",
+            "passed_count": 0,
+            "failed_count": 0,
+            "error_count": 0,
+            "output": "",
+        }
+
     passed = False
     final_output = ""
 
