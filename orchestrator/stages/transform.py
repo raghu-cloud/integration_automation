@@ -16,7 +16,7 @@ import logging
 import re
 from pathlib import Path
 
-from ..integration_config import get_repo_root, get_source_dir, read_all_sources
+from ..integration_config import get_repo_root, get_source_dir, read_all_sources, read_all_test_files
 from ..utils.claude_cli import call_claude
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,39 @@ REQUIREMENTS
 
 Only include files that you actually modified. If a file needs no changes (e.g. __init__.py), omit it.
 Do NOT wrap output in markdown fences.
+"""
+
+# ── Test-file transform prompt ─────────────────────────────────────────────
+
+_TEST_TRANSFORM_PROMPT = """\
+You are an expert Python test engineer.
+The integration source code for the {client} endee integration has just been
+updated. Your job is to update the **test scripts** so they stay in sync with
+the new source code.
+
+─── UPDATED SOURCE FILES ───────────────────────────────────────────────
+{updated_source_block}
+─────────────────────────────────────────────────────────────────────────
+
+─── CURRENT TEST FILES ─────────────────────────────────────────────────
+{test_files_block}
+─────────────────────────────────────────────────────────────────────────
+
+REQUIREMENTS
+1. Update imports, mock targets, and assertions in the tests to match
+   any renamed functions, new parameters, or changed signatures in the source.
+2. Add new test cases for any newly added parameters or features.
+3. Keep existing test coverage — do NOT remove tests unless the feature they
+   tested has been entirely removed.
+4. For unit tests that use mocks, make sure the mock targets match the
+   actual import paths in the updated source code.
+5. Return ALL modified files using this EXACT format per file:
+
+==== FILE: <relative_path> ====
+<complete updated Python source for that file>
+
+Only include test files you actually modified. Do NOT modify source files.
+No markdown fences, no explanations — only the output in the format above.
 """
 
 
@@ -201,9 +234,47 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
             rel_path,
         )
 
+    # ── Phase 2: Update test scripts to match the new source ──────────────
+    test_sources = read_all_test_files(client)
+    test_files_written = []
+
+    if test_sources:
+        # Re-read the updated source files we just wrote
+        updated_source_contents = read_all_sources(client)
+        test_prompt = _TEST_TRANSFORM_PROMPT.format(
+            client=client,
+            updated_source_block=_build_files_block(updated_source_contents),
+            test_files_block=_build_files_block(test_sources),
+        )
+
+        logger.info("[transform][%s] Calling Claude CLI to update tests …", client)
+        raw_tests = call_claude(test_prompt)
+        updated_test_files = _parse_multi_file_response(raw_tests)
+
+        if not updated_test_files and len(test_sources) == 1:
+            only_path = list(test_sources.keys())[0]
+            code = re.sub(r"^```(?:python)?\s*", "", raw_tests.strip())
+            code = re.sub(r"\s*```$", "", code)
+            updated_test_files = {only_path: code}
+
+        for rel_path, code in updated_test_files.items():
+            abs_path = repo_root / rel_path
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_text(code, encoding="utf-8")
+            test_files_written.append(rel_path)
+            logger.info(
+                "[transform][%s] Updated test file %s (%d chars)",
+                client,
+                rel_path,
+                len(code),
+            )
+    else:
+        logger.info("[transform][%s] No test files found — skipping test update.", client)
+
     return {
         "client": client,
         "files_written": files_written,
+        "test_files_written": test_files_written,
         "chars_written": total_chars,
         "success": True,
     }

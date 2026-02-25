@@ -51,6 +51,55 @@ logger = logging.getLogger(__name__)
 _ALL_CLIENTS = ["crewai", "langchain", "llamaindex"]
 
 
+def _build_test_report(test_results: dict) -> str:
+    """Build a formatted Slack test-results report."""
+    lines = ["📊 *Test Results Report*", ""]
+
+    # Header
+    lines.append(f"{'Framework':<14} {'Passed':>7} {'Failed':>7} {'Errors':>7} {'Rounds':>7}  Status")
+    lines.append("─" * 68)
+
+    total_passed = total_failed = total_errors = 0
+
+    for client, tr in test_results.items():
+        p = tr.get("passed_count", 0)
+        f = tr.get("failed_count", 0)
+        e = tr.get("error_count", 0)
+        rounds = tr.get("rounds_used", 0)
+        icon = "✅" if tr["passed"] else "❌"
+        total_passed += p
+        total_failed += f
+        total_errors += e
+        lines.append(f"{icon} {client:<12} {p:>7} {f:>7} {e:>7} {rounds:>7}")
+
+    lines.append("─" * 68)
+    lines.append(f"{'Total':<14} {total_passed:>7} {total_failed:>7} {total_errors:>7}")
+    lines.append("")
+
+    # Add failure details (truncated) for any failing frameworks
+    failing = {c: tr for c, tr in test_results.items() if not tr["passed"]}
+    if failing:
+        lines.append("*Failure Details:*")
+        for client, tr in failing.items():
+            output = tr.get("output", "")
+            # Extract just the FAILURES section if available
+            failure_section = ""
+            if "FAILURES" in output:
+                start = output.index("FAILURES")
+                failure_section = output[start:start + 800]
+            elif "ERRORS" in output:
+                start = output.index("ERRORS")
+                failure_section = output[start:start + 800]
+            else:
+                # Last 400 chars as fallback
+                failure_section = output[-400:]
+
+            lines.append(f"\n`{client}` — {tr.get('summary', 'failed')}")
+            lines.append(f"```{failure_section.strip()}```")
+
+    return "\n".join(lines)
+
+
 def _parse_scope(scope: str | list[str] | None) -> list[str]:
     """Normalise the scope argument into a list of client names."""
     if scope is None or scope == "all":
@@ -165,6 +214,9 @@ def run_pipeline(
         _notify(msg)
         results["errors"].append(msg)
         return results
+
+    # ── Test Results Report ───────────────────────────────────────────────
+    _notify(_build_test_report(test_results))
 
     all_passed = all(tr["passed"] for tr in test_results.values())
 

@@ -131,6 +131,45 @@ def get_test_dir(client: str) -> Path | None:
     return None
 
 
+def get_all_test_files(client: str) -> list[Path]:
+    """
+    Discover every ``.py`` test file inside the repo's ``tests/`` directory.
+
+    Returns a sorted list of *absolute* paths.
+    Returns an empty list if the tests directory doesn't exist.
+    """
+    test_dir = get_test_dir(client)
+    if test_dir is None or not test_dir.exists():
+        logger.warning(
+            "[config] Test dir for '%s' does not exist", client
+        )
+        return []
+    files = sorted(test_dir.rglob("*.py"))
+    logger.info(
+        "[config] Found %d test file(s) for '%s' in %s", len(files), client, test_dir
+    )
+    return files
+
+
+def read_all_test_files(client: str) -> dict[str, str]:
+    """
+    Read every ``.py`` file in the repo's ``tests/`` directory.
+
+    Returns ``{relative_path: content}`` where keys are relative to repo root,
+    e.g. ``tests/test_vector_store.py``.
+    """
+    repo_root = get_repo_root(client)
+    files = get_all_test_files(client)
+    result: dict[str, str] = {}
+    for f in files:
+        try:
+            rel = str(f.relative_to(repo_root))
+        except ValueError:
+            rel = f.name
+        result[rel] = f.read_text(encoding="utf-8", errors="ignore")
+    return result
+
+
 def all_clients() -> list[str]:
     """Return the list of all known client names."""
     return list(_CLIENT_CONFIG.keys())

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
 
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
-import endee
+try:
+    import endee  # noqa: F401
+except ImportError:
+    endee = None  # type: ignore[assignment]
 
 
 class EndeeVectorStore(VectorStore):
@@ -22,22 +24,21 @@ class EndeeVectorStore(VectorStore):
     work without modification.
 
     Args:
-        index: A pre-constructed :class:`endee.Index` instance.
-        embedding: A LangChain :class:`~langchain_core.embeddings.Embeddings`
-            implementation used to embed query strings.
+        index: A pre-constructed endee Index instance.
+        embedding_function: A callable that maps a query string to a list of floats.
         text_key: The metadata key that stores the document's raw text.
             Defaults to ``"text"``.
     """
 
     def __init__(
         self,
-        index: endee.Index,
-        embedding: Embeddings,
+        index: Any,
+        embedding_function: Callable[[str], List[float]],
         *,
         text_key: str = "text",
     ) -> None:
         self._index = index
-        self._embedding = embedding
+        self._embedding_function = embedding_function
         self._text_key = text_key
 
     # ------------------------------------------------------------------
@@ -45,8 +46,8 @@ class EndeeVectorStore(VectorStore):
     # ------------------------------------------------------------------
 
     @property
-    def embeddings(self) -> Optional[Embeddings]:
-        return self._embedding
+    def embeddings(self) -> None:
+        return None
 
     def add_texts(
         self,
@@ -54,38 +55,13 @@ class EndeeVectorStore(VectorStore):
         metadatas: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> List[str]:
-        """Embed *texts* and upsert them into the endee index.
-
-        Args:
-            texts: Iterable of raw text strings to index.
-            metadatas: Optional list of metadata dicts aligned with *texts*.
-            **kwargs: Extra arguments forwarded to :py:meth:`endee.Index.upsert`.
-
-        Returns:
-            List of vector IDs assigned by endee.
-        """
-        text_list = list(texts)
-        vectors = self._embedding.embed_documents(text_list)
-
-        if metadatas is None:
-            metadatas = [{} for _ in text_list]
-
-        items = [
-            {
-                "id": meta.get("id", str(i)),
-                "values": vec,
-                "metadata": {self._text_key: text, **meta},
-            }
-            for i, (text, vec, meta) in enumerate(zip(text_list, vectors, metadatas))
-        ]
-        response = self._index.upsert(vectors=items, **kwargs)
-        return [item["id"] for item in items]
+        raise NotImplementedError("add_texts is not supported for EndeeVectorStore")
 
     def similarity_search(
         self,
         query: str,
         k: int = 4,
-        filter: Optional[Dict[str, Any]] = None,
+        filter: Optional[Any] = None,
         *,
         prefilter_cardinality_threshold: int = 10_000,
         filter_boost_percentage: float = 0.0,
@@ -97,14 +73,13 @@ class EndeeVectorStore(VectorStore):
             query: The natural-language query string to search for.
             k: Number of results to return. Defaults to ``4``.
             filter: Optional metadata filter expression forwarded to
-                :py:meth:`endee.Index.query`.
+                :py:meth:`endee.Index.query`. Omitted when ``None``.
             prefilter_cardinality_threshold: Maximum number of vectors considered
-                during pre-filtering before switching to post-filtering.  Valid
-                range is 1 000 – 1 000 000.  Defaults to ``10_000`` (endee
-                default).
+                during pre-filtering before switching to post-filtering.
+                Valid range is 1 000 – 1 000 000. Defaults to ``10_000``.
             filter_boost_percentage: Percentage boost applied to the relevance
-                score of vectors that match the supplied filter.  Valid range is
-                0 – 100.  Defaults to ``0.0`` (endee default, no boost).
+                score of vectors that match the supplied filter.
+                Valid range is 0 – 100. Defaults to ``0.0``.
             **kwargs: Additional keyword arguments forwarded to
                 :py:meth:`endee.Index.query`.
 
@@ -126,7 +101,7 @@ class EndeeVectorStore(VectorStore):
         self,
         query: str,
         k: int = 4,
-        filter: Optional[Dict[str, Any]] = None,
+        filter: Optional[Any] = None,
         *,
         prefilter_cardinality_threshold: int = 10_000,
         filter_boost_percentage: float = 0.0,
@@ -138,14 +113,13 @@ class EndeeVectorStore(VectorStore):
             query: The natural-language query string to search for.
             k: Number of results to return. Defaults to ``4``.
             filter: Optional metadata filter expression forwarded to
-                :py:meth:`endee.Index.query`.
+                :py:meth:`endee.Index.query`. Omitted when ``None``.
             prefilter_cardinality_threshold: Maximum number of vectors considered
-                during pre-filtering before switching to post-filtering.  Valid
-                range is 1 000 – 1 000 000.  Defaults to ``10_000`` (endee
-                default).
+                during pre-filtering before switching to post-filtering.
+                Valid range is 1 000 – 1 000 000. Defaults to ``10_000``.
             filter_boost_percentage: Percentage boost applied to the relevance
-                score of vectors that match the supplied filter.  Valid range is
-                0 – 100.  Defaults to ``0.0`` (endee default, no boost).
+                score of vectors that match the supplied filter.
+                Valid range is 0 – 100. Defaults to ``0.0``.
             **kwargs: Additional keyword arguments forwarded to
                 :py:meth:`endee.Index.query`.
 
@@ -153,20 +127,23 @@ class EndeeVectorStore(VectorStore):
             List of ``(Document, score)`` tuples ordered by descending
             similarity score.
         """
-        query_vector = self._embedding.embed_query(query)
+        query_vector = self._embedding_function(query)
 
-        response = self._index.query(
-            vector=query_vector,
-            top_k=k,
-            filter=filter,
-            include_metadata=True,
-            prefilter_cardinality_threshold=prefilter_cardinality_threshold,
-            filter_boost_percentage=filter_boost_percentage,
+        query_kwargs: Dict[str, Any] = {
+            "vector": query_vector,
+            "top_k": k,
+            "include_metadata": True,
+            "prefilter_cardinality_threshold": prefilter_cardinality_threshold,
+            "filter_boost_percentage": filter_boost_percentage,
             **kwargs,
-        )
+        }
+        if filter is not None:
+            query_kwargs["filter"] = filter
+
+        response = self._index.query(**query_kwargs)
 
         results: List[Tuple[Document, float]] = []
-        for match in response.get("matches", []):
+        for match in response:
             metadata = dict(match.get("metadata", {}))
             page_content = metadata.pop(self._text_key, "")
             doc = Document(page_content=page_content, metadata=metadata)
@@ -183,69 +160,19 @@ class EndeeVectorStore(VectorStore):
     def from_texts(
         cls: Type[EndeeVectorStore],
         texts: List[str],
-        embedding: Embeddings,
+        embedding: Any,
         metadatas: Optional[List[Dict[str, Any]]] = None,
-        index: Optional[endee.Index] = None,
-        text_key: str = "text",
         **kwargs: Any,
     ) -> EndeeVectorStore:
-        """Create an :class:`EndeeVectorStore` from a list of raw texts.
-
-        Args:
-            texts: Raw text strings to embed and index.
-            embedding: Embeddings implementation for encoding the texts.
-            metadatas: Optional list of metadata dicts aligned with *texts*.
-            index: An existing :class:`endee.Index` to upsert into.  Required
-                unless the subclass overrides index creation.
-            text_key: Metadata key used to store raw text.  Defaults to
-                ``"text"``.
-            **kwargs: Extra arguments forwarded to :py:meth:`add_texts`.
-
-        Returns:
-            A populated :class:`EndeeVectorStore` instance.
-
-        Raises:
-            ValueError: If *index* is not provided.
-        """
-        if index is None:
-            raise ValueError(
-                "An endee.Index instance must be supplied via the 'index' argument."
-            )
-        store = cls(index=index, embedding=embedding, text_key=text_key)
-        store.add_texts(texts, metadatas=metadatas, **kwargs)
-        return store
+        raise NotImplementedError("from_texts is not supported for EndeeVectorStore")
 
     @classmethod
     def from_documents(
         cls: Type[EndeeVectorStore],
         documents: List[Document],
-        embedding: Embeddings,
-        index: Optional[endee.Index] = None,
-        text_key: str = "text",
+        embedding: Any,
         **kwargs: Any,
     ) -> EndeeVectorStore:
-        """Create an :class:`EndeeVectorStore` from a list of LangChain documents.
-
-        Args:
-            documents: :class:`~langchain_core.documents.Document` objects to
-                embed and index.
-            embedding: Embeddings implementation for encoding document content.
-            index: An existing :class:`endee.Index` to upsert into.  Required
-                unless the subclass overrides index creation.
-            text_key: Metadata key used to store raw text.  Defaults to
-                ``"text"``.
-            **kwargs: Extra arguments forwarded to :py:meth:`add_texts`.
-
-        Returns:
-            A populated :class:`EndeeVectorStore` instance.
-        """
-        texts = [doc.page_content for doc in documents]
-        metadatas = [doc.metadata for doc in documents]
-        return cls.from_texts(
-            texts,
-            embedding,
-            metadatas=metadatas,
-            index=index,
-            text_key=text_key,
-            **kwargs,
+        raise NotImplementedError(
+            "from_documents is not supported for EndeeVectorStore"
         )

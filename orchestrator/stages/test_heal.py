@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..integration_config import get_repo_root, get_source_dir, read_all_sources
+from ..integration_config import get_repo_root, get_source_dir, read_all_sources, read_all_test_files
 from ..utils.claude_cli import call_claude
 
 logger = logging.getLogger(__name__)
@@ -55,9 +55,9 @@ def _get_test_path(client: str, base_dir: str) -> tuple[str, str]:
 
 _HEAL_PROMPT = """\
 The pytest test suite for the {client} endee integration has failing tests.
-Your job is to fix the integration source code so that ALL tests pass.
+Your job is to fix the code so that ALL tests pass.
 
-Do NOT modify the test file(s).
+You may modify BOTH the source files AND the test files if needed.
 
 ─── FAILING TEST OUTPUT ─────────────────────────────────────────────────────
 {test_output}
@@ -67,9 +67,14 @@ Do NOT modify the test file(s).
 {all_files_block}
 ─────────────────────────────────────────────────────────────────────────────
 
+─── CURRENT TEST FILES ──────────────────────────────────────────────────────
+{test_files_block}
+─────────────────────────────────────────────────────────────────────────────
+
 Instructions:
 - Read the test failures carefully to understand what is expected.
-- Fix only the integration code (the source files shown above).
+- Fix either source code, test code, or both — whatever is needed.
+- When fixing tests, ensure imports and mock targets match the actual source.
 - Return ALL modified files using this EXACT format per file:
 
 ==== FILE: <relative_path> ====
@@ -120,9 +125,25 @@ def _run_pytest(test_target: str, cwd: str) -> tuple[bool, str]:
     return result.returncode == 0, output
 
 
+def _parse_test_counts(output: str) -> dict[str, int]:
+    """Extract passed/failed/error counts from pytest output."""
+    counts = {"passed": 0, "failed": 0, "errors": 0}
+    m = re.search(r"(\d+) passed", output)
+    if m:
+        counts["passed"] = int(m.group(1))
+    m = re.search(r"(\d+) failed", output)
+    if m:
+        counts["failed"] = int(m.group(1))
+    m = re.search(r"(\d+) error", output)
+    if m:
+        counts["errors"] = int(m.group(1))
+    return counts
+
+
 def _heal(client: str, test_output: str, base_dir: str) -> None:
-    """Ask Claude to fix all integration source files and write fixes to disk."""
+    """Ask Claude to fix source and/or test files and write fixes to disk."""
     sources = read_all_sources(client)
+    test_sources = read_all_test_files(client)
     repo_root = get_repo_root(client)
 
     prompt = _HEAL_PROMPT.format(
@@ -132,6 +153,10 @@ def _heal(client: str, test_output: str, base_dir: str) -> None:
             _build_files_block(sources) if sources
             else "(no source files found)"
         ),
+        test_files_block=(
+            _build_files_block(test_sources) if test_sources
+            else "(no test files found)"
+        ),
     )
 
     logger.info("[test_heal][%s] Asking Claude to heal failing tests …", client)
@@ -140,7 +165,6 @@ def _heal(client: str, test_output: str, base_dir: str) -> None:
     updated_files = _parse_multi_file_response(raw)
 
     if not updated_files and len(sources) == 1:
-        # Fallback for single-file repos
         only_path = list(sources.keys())[0]
         code = re.sub(r"^```(?:python)?\s*", "", raw.strip())
         code = re.sub(r"\s*```$", "", code)
@@ -184,15 +208,19 @@ def _test_and_heal_one(client: str, base_dir: str = ".") -> dict:
                 client, MAX_HEAL_ROUNDS,
             )
 
-    # Extract summary line from pytest output (e.g. "3 passed, 1 failed")
+    # Extract summary line and structured counts from pytest output
     summary_match = re.search(r"(\d+ (?:passed|failed)[^\n]*)", final_output)
     summary = summary_match.group(1) if summary_match else ("passed" if passed else "failed")
+    counts = _parse_test_counts(final_output)
 
     return {
         "client": client,
         "passed": passed,
         "rounds_used": round_num + 1,
         "summary": summary,
+        "passed_count": counts["passed"],
+        "failed_count": counts["failed"],
+        "error_count": counts["errors"],
         "output": final_output,
     }
 
