@@ -162,10 +162,82 @@ def _parse_multi_file_response(raw: str) -> dict[str, str]:
         code = re.sub(r"^```(?:python)?\s*", "", code)
         code = re.sub(r"\s*```$", "", code)
         if rel_path and code:
+            # Sanitize: remove any leading prose before actual Python code
+            code = _sanitize_code(code)
             files[rel_path] = code
         i += 2
 
     return files
+
+
+def _sanitize_code(code: str) -> str:
+    """
+    Strip leading prose/summary lines that Claude sometimes adds before code.
+
+    Removes lines before the first line that looks like Python (import, from,
+    class, def, #, triple-quote, decorator, or assignment).
+    Also strips trailing prose after the last Python-looking line.
+    """
+    lines = code.split("\n")
+
+    # Pattern for lines that are clearly Python code
+    python_line = re.compile(
+        r"^\s*("
+        r"import |from |class |def |#|@|\"\"\"|\'\'\'"
+        r"|if |elif |else:|try:|except |finally:|with "
+        r"|return |raise |yield |assert "
+        r"|[A-Z_][A-Z_0-9]*\s*=|[a-z_][a-z_0-9]*\s*="
+        r"|__"
+        r"|\)"
+        r"|\]"
+        r")"
+    )
+
+    # Find first Python-looking line
+    first_code = 0
+    for idx, line in enumerate(lines):
+        if python_line.match(line):
+            first_code = idx
+            break
+
+    # Find last Python-looking line (scan from end, skip blanks)
+    last_code = len(lines) - 1
+    for idx in range(len(lines) - 1, first_code - 1, -1):
+        line = lines[idx]
+        # Skip trailing blank lines
+        if line.strip() == "":
+            continue
+        # Indented lines are always code (continuations, method bodies, etc.)
+        if line.startswith("    ") or line.startswith("\t"):
+            last_code = idx
+            break
+        # Unindented lines must match Python patterns, otherwise they're prose
+        if python_line.match(line):
+            last_code = idx
+            break
+        # This is an unindented non-Python line — prose.  Keep scanning backwards.
+        last_code = idx - 1
+
+    cleaned = "\n".join(lines[first_code : last_code + 1])
+    return cleaned.strip()
+
+
+def _validate_python(code: str, filepath: str) -> bool:
+    """
+    Check if code is valid Python by attempting to compile it.
+
+    Returns True if the code compiles, False otherwise.
+    Logs a warning on failure.
+    """
+    try:
+        compile(code, filepath, "exec")
+        return True
+    except SyntaxError as e:
+        logger.warning(
+            "[validate] REJECTED %s — invalid Python (line %s): %s",
+            filepath, e.lineno, e.msg,
+        )
+        return False
 
 
 def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
@@ -207,6 +279,7 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
             only_path = list(sources.keys())[0]
             code = re.sub(r"^```(?:python)?\s*", "", raw.strip())
             code = re.sub(r"\s*```$", "", code)
+            code = _sanitize_code(code)
             updated_files = {only_path: code}
         else:
             logger.error(
@@ -222,6 +295,12 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
     total_chars = 0
     files_written = []
     for rel_path, code in updated_files.items():
+        if not _validate_python(code, rel_path):
+            logger.error(
+                "[transform][%s] SKIPPED writing %s — Claude output is not valid Python.",
+                client, rel_path,
+            )
+            continue
         abs_path = repo_root / rel_path
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(code, encoding="utf-8")
@@ -255,9 +334,16 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
             only_path = list(test_sources.keys())[0]
             code = re.sub(r"^```(?:python)?\s*", "", raw_tests.strip())
             code = re.sub(r"\s*```$", "", code)
+            code = _sanitize_code(code)
             updated_test_files = {only_path: code}
 
         for rel_path, code in updated_test_files.items():
+            if not _validate_python(code, rel_path):
+                logger.error(
+                    "[transform][%s] SKIPPED writing test %s — not valid Python.",
+                    client, rel_path,
+                )
+                continue
             abs_path = repo_root / rel_path
             abs_path.parent.mkdir(parents=True, exist_ok=True)
             abs_path.write_text(code, encoding="utf-8")

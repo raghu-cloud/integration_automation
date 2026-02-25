@@ -103,10 +103,66 @@ def _parse_multi_file_response(raw: str) -> dict[str, str]:
         code = re.sub(r"^```(?:python)?\s*", "", code)
         code = re.sub(r"\s*```$", "", code)
         if rel_path and code:
+            code = _sanitize_code(code)
             files[rel_path] = code
         i += 2
 
     return files
+
+
+def _sanitize_code(code: str) -> str:
+    """
+    Strip leading/trailing prose lines that Claude sometimes adds.
+
+    Removes lines before the first line that looks like Python code
+    and after the last Python-looking line.
+    """
+    lines = code.split("\n")
+    python_line = re.compile(
+        r"^\s*("
+        r"import |from |class |def |#|@|\"\"\"|\'\'\'"
+        r"|if |elif |else:|try:|except |finally:|with "
+        r"|return |raise |yield |assert "
+        r"|[A-Z_][A-Z_0-9]*\s*=|[a-z_][a-z_0-9]*\s*="
+        r"|__"
+        r"|\)"
+        r"|\]"
+        r")"
+    )
+
+    first_code = 0
+    for idx, line in enumerate(lines):
+        if python_line.match(line):
+            first_code = idx
+            break
+
+    last_code = len(lines) - 1
+    for idx in range(len(lines) - 1, first_code - 1, -1):
+        line = lines[idx]
+        if line.strip() == "":
+            continue
+        if line.startswith("    ") or line.startswith("\t"):
+            last_code = idx
+            break
+        if python_line.match(line):
+            last_code = idx
+            break
+        last_code = idx - 1
+
+    return "\n".join(lines[first_code : last_code + 1]).strip()
+
+
+def _validate_python(code: str, filepath: str) -> bool:
+    """Check if code is valid Python. Returns True if it compiles."""
+    try:
+        compile(code, filepath, "exec")
+        return True
+    except SyntaxError as e:
+        logger.warning(
+            "[validate] REJECTED %s — invalid Python (line %s): %s",
+            filepath, e.lineno, e.msg,
+        )
+        return False
 
 
 def _run_pytest(test_target: str, cwd: str) -> tuple[bool, str]:
@@ -164,9 +220,16 @@ def _heal(client: str, test_output: str, base_dir: str) -> None:
         only_path = list(sources.keys())[0]
         code = re.sub(r"^```(?:python)?\s*", "", raw.strip())
         code = re.sub(r"\s*```$", "", code)
+        code = _sanitize_code(code)
         updated_files = {only_path: code}
 
     for rel_path, code in updated_files.items():
+        if not _validate_python(code, rel_path):
+            logger.error(
+                "[test_heal][%s] SKIPPED writing %s — Claude output is not valid Python.",
+                client, rel_path,
+            )
+            continue
         abs_path = repo_root / rel_path
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(code, encoding="utf-8")
