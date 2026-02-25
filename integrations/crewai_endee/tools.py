@@ -1,9 +1,58 @@
-I need your approval to overwrite `tools.py`. The file currently contains prose text (not Python), causing the `SyntaxError`. The replacement I've prepared:
+try:
+    from crewai_tools import BaseTool
+except ImportError:
+    class BaseTool:
+        """Fallback stub when crewai_tools is not installed."""
+        name: str = ""
+        description: str = ""
 
-- Defines `EndeeSearchInput` (Pydantic model) with the required fields and validation constraints:
-  - `prefilter_cardinality_threshold`: default `10_000`, min `1_000`, max `1_000_000`
-  - `filter_boost_percentage`: default `0`, min `0`, max `100`
-- Defines `EndeeSearchTool` with `_run()` that calls `self.index.query()` and omits the `filter` key when it's `None`
-- Has a graceful fallback stub when `crewai_tools` isn't installed
+        def _run(self):
+            raise NotImplementedError
 
-Please approve the write so I can fix the file.
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+
+class EndeeSearchInput(BaseModel):
+    vector: List[float] = Field(..., description="Query vector for similarity search")
+    top_k: int = Field(10, description="Number of results to return")
+    filter: Optional[dict] = Field(None, description="Optional metadata filter")
+    prefilter_cardinality_threshold: int = Field(
+        10000,
+        ge=1000,
+        le=1_000_000,
+        description="Threshold for switching between prefilter and postfilter (1k–1M)",
+    )
+    filter_boost_percentage: int = Field(
+        0,
+        ge=0,
+        le=100,
+        description="Percentage boost applied to filtered results (0–100)",
+    )
+
+
+class EndeeSearchTool(BaseTool):
+    name: str = "EndeeSearch"
+    description: str = "Performs vector similarity search using the endee index."
+
+    def __init__(self, index, **kwargs):
+        super().__init__(**kwargs)
+        self.index = index
+
+    def _run(
+        self,
+        vector: List[float],
+        top_k: int = 10,
+        filter: Optional[dict] = None,
+        prefilter_cardinality_threshold: int = 10000,
+        filter_boost_percentage: int = 0,
+    ) -> list:
+        kwargs = dict(
+            vector=vector,
+            top_k=top_k,
+            prefilter_cardinality_threshold=prefilter_cardinality_threshold,
+            filter_boost_percentage=filter_boost_percentage,
+        )
+        if filter is not None:
+            kwargs["filter"] = filter
+        return self.index.query(**kwargs)
