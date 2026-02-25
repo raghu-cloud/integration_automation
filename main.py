@@ -1,12 +1,26 @@
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
-import os, ast, difflib, shutil, requests, tarfile, zipfile
+import os, ast, difflib, shutil, requests, tarfile, zipfile, logging
 from pathlib import Path
 from dotenv import load_dotenv
-
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+
+# ── Pipeline orchestrator ──────────────────────────────────────────────────────
+try:
+    from orchestrator.pipeline import run_pipeline as _run_pipeline
+    logger.info("Pipeline orchestrator loaded successfully.")
+except Exception as _e:
+    _run_pipeline = None
+    logger.warning("Pipeline orchestrator could not be loaded: %s", _e)
 
 # ─────────────────────────────────────────
 # CONFIG — change these
@@ -225,12 +239,216 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
         channel = event.get("channel")
         bot_id  = event.get("bot_id")
 
+        # ── Existing: trigger package comparison ──────────────────────────────
         # Trigger agent when user types "run <version1> <version2>"
         if text.startswith("run") and not bot_id:
             parts = text.split()
             v1 = parts[1] if len(parts) > 1 else VERSION_1
             v2 = parts[2] if len(parts) > 2 else VERSION_2
-            print(v1,v2)
             background_tasks.add_task(run_comparison, channel, v1, v2)
 
+        # ── New: trigger pipeline via message ─────────────────────────────────
+        # Trigger when user types "automate" in a channel message
+        elif text.startswith("automate") and not bot_id:
+            background_tasks.add_task(
+                _run_pipeline_background,
+                channel,
+                event.get("user", ""),
+                "auto/endee-update",
+                "all",
+            )
+
     return {"status": "ok"}
+
+
+# ─────────────────────────────────────────
+# SLASH COMMAND:  /sync-clients
+# ─────────────────────────────────────────
+# Register this URL in Slack:
+#   Slash Commands → Request URL → https://your-host/slack/slash/sync-clients
+#
+# Usage:
+#   /sync-clients
+#   /sync-clients --branch feature/my-branch --scope all
+#   /sync-clients --branch hotfix/x --scope crewai,langchain
+
+import shlex as _shlex
+
+
+def _parse_slash_args(text: str) -> tuple[str, str]:
+    """
+    Parse /sync-clients command arguments.
+
+    Supported flags:
+      --branch <name>    Git branch to commit to (default: auto/endee-update)
+      --scope  <list>    Comma-separated clients or "all" (default: all)
+
+    Returns:
+        (branch, scope)
+    """
+    branch = "auto/endee-update"
+    scope = "all"
+
+    try:
+        tokens = _shlex.split(text or "")
+    except ValueError:
+        tokens = (text or "").split()
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--branch" and i + 1 < len(tokens):
+            branch = tokens[i + 1]
+            i += 2
+        elif tok == "--scope" and i + 1 < len(tokens):
+            scope = tokens[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    return branch, scope
+
+
+@app.post("/slack/slash/sync-clients")
+async def slash_sync_clients(request: Request, background_tasks: BackgroundTasks):
+    """
+    Handle the /sync-clients Slack slash command.
+
+    Slack requires a response within 3 seconds, so we acknowledge immediately
+    and run the pipeline in a background task.
+
+    Slack slash command payload (form-encoded):
+        command     = /sync-clients
+        text        = --branch feature/x --scope all
+        channel_id  = C0123456
+        user_id     = U0123456
+        response_url= https://hooks.slack.com/commands/…
+    """
+    form = await request.form()
+    channel = form.get("channel_id", "")
+    user = form.get("user_id", "")
+    text = form.get("text", "")
+
+    branch, scope = _parse_slash_args(text)
+
+    background_tasks.add_task(_run_pipeline_background, channel, user, branch, scope)
+
+    return {
+        "response_type": "ephemeral",
+        "text": (
+            f"⚙️ Starting `sync-clients` pipeline…\n"
+            f"Branch: `{branch}` | Scope: `{scope}`\n"
+            "Progress updates will appear in this channel."
+        ),
+    }
+
+
+# ─────────────────────────────────────────
+# SHARED PIPELINE RUNNER (background task)
+# ─────────────────────────────────────────
+
+def _run_pipeline_background(
+    channel: str,
+    trigger_user: str,
+    branch: str,
+    scope: str,
+) -> None:
+    """
+    Background task that runs the four-stage pipeline and streams progress
+    back to Slack via chat_postMessage after each stage.
+
+    Pipeline:
+      Stage 1 — claude -p  "parse diff → structured JSON"
+      Stage 2 — claude -p  "update crewai/langchain/llamaindex code" (×3 parallel)
+      Stage 3 — pytest → if fail → claude -p "fix it" → retry (up to 3×)
+      Stage 4 — claude -p  "write PR title+body" → gh pr create
+    """
+    if _run_pipeline is None:
+        slack_client.chat_postMessage(
+            channel=channel,
+            text=(
+                "❌ Pipeline orchestrator is not available.\n"
+                "Ensure the `claude` CLI is installed (`npm install -g @anthropic-ai/claude-code`) "
+                "and `pip install -r requirements.txt` has been run."
+            ),
+        )
+        return
+
+    report_path = Path(os.getenv("COMPARISON_REPORT_PATH", REPORT_FILE))
+    if not report_path.exists():
+        slack_client.chat_postMessage(
+            channel=channel,
+            text=(
+                f"❌ Comparison report not found at `{report_path}`.\n"
+                "Run a comparison first (`run <v1> <v2>`), then re-trigger automation."
+            ),
+        )
+        return
+
+    report_content = report_path.read_text(encoding="utf-8")
+
+    # Starter message — all stage updates will be threaded under it
+    resp = slack_client.chat_postMessage(
+        channel=channel,
+        text=(
+            f"🤖 <@{trigger_user}> triggered *sync-clients* "
+            f"(branch: `{branch}`, scope: `{scope}`)"
+        ),
+    )
+    thread_ts = resp.get("ts")
+
+    def _notify(msg: str) -> None:
+        """Post a progress update to the Slack thread."""
+        slack_client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=msg,
+        )
+
+    try:
+        results = _run_pipeline(
+            report_content=report_content,
+            branch=branch,
+            scope=scope,
+            notify=_notify,
+        )
+
+        # Final summary
+        pr_urls = [
+            pr.get("url")
+            for pr in results.get("prs", {}).values()
+            if pr.get("url")
+        ]
+        errors = results.get("errors", [])
+        success = results.get("success", False)
+
+        summary_lines = ["─" * 40]
+        summary_lines.append(
+            "✅ *Pipeline finished successfully!*" if success
+            else "⚠️ *Pipeline finished with errors.*"
+        )
+        if pr_urls:
+            summary_lines.append("*Pull Requests:*")
+            summary_lines.extend(f"  • {url}" for url in pr_urls)
+        if errors:
+            summary_lines.append("*Errors:*")
+            summary_lines.extend(f"  • {e}" for e in errors[:5])
+
+        slack_client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text="\n".join(summary_lines),
+        )
+
+        logger.info(
+            "[pipeline] Done. success=%s PRs=%s errors=%s",
+            success, pr_urls, errors,
+        )
+
+    except Exception as exc:
+        logger.exception("[pipeline] Unhandled exception.")
+        slack_client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"❌ Pipeline encountered an unexpected error: `{exc}`",
+        )

@@ -1,139 +1,184 @@
 
 PACKAGE : endee
 v1      : 0.1.9
-v2      : 0.1.13
+v2      : 0.1.10
 ==================================================
 📄 LINE BY LINE CODE DIFF
 ==================================================
 
-📄 endee/constants.py
-     # Default ef_search: size of dynamic candidate list during search
-     # Higher values improve recall but slow down queries
-     DEFAULT_EF_SEARCH = 128
-➕  
-➕  # Default prefilter cardinality threshold: if the number of vectors matching the
-➕  # filter is below this value, brute-force prefiltering is used instead of HNSW
-➕  # filtered search. Valid range is 1,000–1,000,000.
-➕  DEFAULT_PREFILTER_CARDINALITY_THRESHOLD = 10_000
-➕  
-➕  # Default filter boost percentage: expands the internal HNSW candidate pool by
-➕  # this percentage when a filter is active, compensating for filtered-out results.
-➕  # 0 means no boost; valid range is 0–100.
-➕  DEFAULT_FILTER_BOOST_PERCENTAGE = 0
-
-📄 endee/index.py
-         CHECKSUM,
-         COUNT_FIELD,
-         DEFAULT_EF_SEARCH,
-➕      DEFAULT_FILTER_BOOST_PERCENTAGE,
-➕      DEFAULT_PREFILTER_CARDINALITY_THRESHOLD,
-         DEFAULT_TOPK,
-         DIMENSION_FIELD,
-         IS_HYBRID_FIELD,
-             log=False,
-             sparse_indices=None,
-             sparse_values=None,
-➕          prefilter_cardinality_threshold=DEFAULT_PREFILTER_CARDINALITY_THRESHOLD,
-➕          filter_boost_percentage=DEFAULT_FILTER_BOOST_PERCENTAGE,
-         ):
-             """
-             Search for similar vectors in the index.
-                 log: Currently unused (for future logging support)
-                 sparse_indices: Sparse vector indices (for hybrid indexes)
-                 sparse_values: Sparse vector values (for hybrid indexes)
-➕              prefilter_cardinality_threshold: Cardinality threshold that controls when
-➕                  filtering switches from HNSW filtered search to brute-force
-➕                  prefiltering on the matched subset.
-➕                  - 1_000     → minimum value, prefilter only for very selective filters
-➕                  - 10_000    → prefilter only when filter matches ≤10k vectors (default)
-➕                  - 1_000_000 → maximum value, prefilter for almost all filtered searches
-➕                  Range: 1,000–1,000,000.
-➕              filter_boost_percentage: Expands the internal HNSW candidate pool by this
-➕                  percentage when a filter is active, compensating for vectors filtered
-➕                  out during traversal. For example, 20 means fetch 20% more candidates
-➕                  before applying the filter.
-➕                  Range: 0-100 (default: 0, i.e. no boost).
-➕  
-     
-             Returns:
-                 list: List of dictionaries containing:
-                 ValueError: If parameters are invalid or incompatible with index type
-     
-             Example:
-➖              >>> results = index.query(
-➕               >>> results = index.query(
-                 ...     vector=[0.1, 0.2, 0.3],
-                 ...     top_k=5,
-➖              ...     filter={"category": "A"}
-➕              ...     filter=[{"category": {"$eq": "A"}}],
-➕              ...     prefilter_threshold=5000,
-➕              ...     boost_percentage=20,
-                 ... )
-             """
-             # Validate and prepare query using Pydantic
-                 include_vectors=include_vectors,
-                 sparse_indices=sparse_indices,
-                 sparse_values=sparse_values,
-➕              prefilter_cardinality_threshold=prefilter_cardinality_threshold,
-➕              filter_boost_percentage=filter_boost_percentage,
-             )
-     
-             # Additional index-specific validation
-             # Add filter if provided
-             if query_params.filter:
-                 data["filter"] = orjson.dumps(query_params.filter).decode("utf-8")
-➕  
-➕          # Sending filter_params so the server uses consistent defaults
-➕          data["filter_params"] = {
-➕              "prefilter_threshold": query_params.prefilter_cardinality_threshold,
-➕              "boost_percentage": query_params.filter_boost_percentage,
-➕          }
-     
-             url = f"{self.url}/index/{self.name}/search"
+📄 endee/endee.py
+                     token=self.token,
+                     url=self.base_url,
+                     version=self.version,
+➖                  params=metadata.model_dump(by_alias=True),
+➕                  params=metadata.dict(by_alias=True),
+                     session_client_manager=self.session_manager,
+                 )
+             else:
+                     token=self.token,
+                     url=self.base_url,
+                     version=self.version,
+➖                  params=metadata.model_dump(by_alias=True),
+➕                  params=metadata.dict(by_alias=True),
+                     session_client_manager=self.client_manager,
+                 )
      
 
 📄 endee/schema.py
+     import sys
+     from typing import Any, Dict, List, Optional, Union
+     
+➖  from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+➕  from pydantic import BaseModel, Field, root_validator, validator
      
      from .constants import (
          DEFAULT_EF_SEARCH,
-➕      DEFAULT_FILTER_BOOST_PERCENTAGE,
-➕      DEFAULT_PREFILTER_CARDINALITY_THRESHOLD,
-         DEFAULT_TOPK,
-         MAX_DIMENSION_ALLOWED,
-         MAX_EF_SEARCH_ALLOWED,
-         include_vectors: bool = False
+     class VectorItem(BaseModel):
+         """Model for a single vector item in an upsert operation."""
+     
+➖      id: str = Field(..., min_length=1)
+➕      id: str
+         vector: List[float]
+         meta: Optional[Dict[str, Any]] = Field(default_factory=dict)
+         filter: Optional[Dict[str, Any]] = Field(default_factory=dict)
          sparse_indices: Optional[List[int]] = None
          sparse_values: Optional[List[float]] = None
-➕      prefilter_cardinality_threshold: int = Field(
-➕          default=DEFAULT_PREFILTER_CARDINALITY_THRESHOLD, ge=1_000, le=1_000_000
-➕      )
-➕      filter_boost_percentage: int = Field(
-➕          default=DEFAULT_FILTER_BOOST_PERCENTAGE, ge=0, le=100
-➕      )
      
-         @model_validator(mode="after")
-         def validate_query_type(self) -> "QueryRequest":
+➖      @model_validator(mode="after")
+➖      def validate_sparse_data(self) -> "VectorItem":
+➖          if (self.sparse_indices is None) != (self.sparse_values is None):
+➕      @validator("id")
+➕      @classmethod
+➕      def validate_id(cls, v: str) -> str:
+➕          if len(v) < 1:
+➕              raise ValueError("id must not be empty")
+➕          return v
+➕  
+➕      @root_validator
+➕      @classmethod
+➕      def validate_sparse_data(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+➕          sparse_indices = values.get("sparse_indices")
+➕          sparse_values = values.get("sparse_values")
+➕  
+➕          if (sparse_indices is None) != (sparse_values is None):
+                 raise ValueError(
+                     "Both sparse_indices and sparse_values must be provided together"
+                 )
+➖          if self.sparse_indices is not None and len(self.sparse_indices) != len(
+➖              self.sparse_values
+➖          ):
+➕          if sparse_indices is not None and len(sparse_indices) != len(sparse_values):
+                 raise ValueError("sparse_indices and sparse_values must match in length")
+➖          return self
+➕          return values
+     
+     
+     class QueryRequest(BaseModel):
+         sparse_indices: Optional[List[int]] = None
+         sparse_values: Optional[List[float]] = None
+     
+➖      @model_validator(mode="after")
+➖      def validate_query_type(self) -> "QueryRequest":
+➖          has_dense = self.vector is not None
+➖          has_sparse = self.sparse_indices is not None or self.sparse_values is not None
+➕      @root_validator
+➕      @classmethod
+➕      def validate_query_type(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+➕          vector = values.get("vector")
+➕          sparse_indices = values.get("sparse_indices")
+➕          sparse_values = values.get("sparse_values")
+➕  
+➕          has_dense = vector is not None
+➕          has_sparse = sparse_indices is not None or sparse_values is not None
+     
+             if not has_dense and not has_sparse:
+                 raise ValueError(
+                     " must be provided."
+                 )
+     
+➖          if (self.sparse_indices is None) != (self.sparse_values is None):
+➕          if (sparse_indices is None) != (sparse_values is None):
+                 raise ValueError(
+                     "Both sparse_indices and sparse_values must be provided together"
+                 )
+     
+➖          if self.sparse_indices is not None and len(self.sparse_indices) != len(
+➖              self.sparse_values
+➖          ):
+➕          if sparse_indices is not None and len(sparse_indices) != len(sparse_values):
+                 raise ValueError("sparse_indices and sparse_values must match in length")
+     
+➖          return self
+➕          return values
+     
+     
+     class IndexCreateRequest(BaseModel):
+         version: Optional[int] = None
+         sparse_dim: int = Field(default=0, ge=0, le=sys.maxsize)
+     
+➖      @field_validator("name")
+➕      @validator("name")
+         @classmethod
+         def validate_name(cls, v: str) -> str:
+             if not re.match(r"^[a-zA-Z0-9_]+$", v):
+                 )
+             return v
+     
+➖      @field_validator("space_type")
+➕      @validator("space_type")
+         @classmethod
+         def validate_space_type(cls, v: str) -> str:
+             v = v.lower()
+                 )
+             return v
+     
+➖      @field_validator("precision")
+➕      @validator("precision")
+         @classmethod
+         def validate_precision(cls, v: Union[str, Precision]) -> Union[str, Precision]:
+             if isinstance(v, Precision):
+     class IndexMetadata(BaseModel):
+         """Model for index metadata returned by the server."""
+     
+➖      model_config = ConfigDict(populate_by_name=True)
+➕      class Config:
+➕          allow_population_by_field_name = True
+     
+         name: Optional[str] = Field(None, alias="name")
+         lib_token: str
 
 📄 setup.py
      setup(
          # Package Metadata
          name="endee",
 ➖      version="0.1.9",
-➕      version="0.1.13",
+➕      version="0.1.10",
          author="Endee Labs",
          author_email="dev@endee.io",
          description=(
+             "numpy>=2.2.4",  # Array operations and vector normalization
+             "msgpack>=1.1.0",  # Efficient binary serialization
+             "orjson>=3.11.5",  # Ultra-fast JSON serialization/deserialization
+➖          "pydantic>=2.0.0",  # Data validation and settings management
+➕          "pydantic==1.10.26",  # Data validation and settings management
+         ],
+         # Python Version Requirements
+         python_requires=">=3.6",
 ==================================================
 🔍 CHANGED FUNCTION SIGNATURES
 ==================================================
-(NEW = added in v0.1.13 | REMOVED = absent in v0.1.13 compared to v0.1.9)
+(NEW = added in v0.1.10 | REMOVED = absent in v0.1.10 compared to v0.1.9)
 
-📁 endee/index.py
+📁 endee/schema.py
+  ✅ NEW (v0.1.10):     def validate_id(cls, v)
   ✏️  CHANGED:
-      v0.1.9: def query(self, vector, top_k, filter, ef, include_vectors, log, sparse_indices, sparse_values)
-      v0.1.13: def query(self, vector, top_k, filter, ef, include_vectors, log, sparse_indices, sparse_values, prefilter_cardinality_threshold, filter_boost_percentage)
+      v0.1.9: def validate_query_type(self)
+      v0.1.10: def validate_query_type(cls, values)
+  ✏️  CHANGED:
+      v0.1.9: def validate_sparse_data(self)
+      v0.1.10: def validate_sparse_data(cls, values)
 ==================================================
 📦 DEPENDENCIES COMPARISON
 ==================================================
-(Added = new in v0.1.13 | Removed = absent in v0.1.13 compared to v0.1.9)
+(Added = new in v0.1.10 | Removed = absent in v0.1.10 compared to v0.1.9)
 No dependency changes found.
