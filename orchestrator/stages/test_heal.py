@@ -2,7 +2,7 @@
 Stage 3 – Test + Self-Heal
 ===========================
 For each integration:
-  1. Run pytest against the dedicated test file.
+  1. Run pytest against the dedicated test file(s).
   2. If tests fail AND we still have heal rounds left, ask Claude CLI to fix
      the integration source, write the fix, and rerun.
   3. Repeat up to MAX_HEAL_ROUNDS times.
@@ -19,84 +19,143 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..integration_config import get_repo_root, get_source_dir, read_all_sources
 from ..utils.claude_cli import call_claude
 
 logger = logging.getLogger(__name__)
 
 MAX_HEAL_ROUNDS = 3
 
-_TEST_FILES: dict[str, str] = {
+# Project-level test files (fallback when repo has no tests/ dir)
+_PROJECT_TEST_FILES: dict[str, str] = {
     "crewai": "tests/test_crewai_integration.py",
     "langchain": "tests/test_langchain_integration.py",
     "llamaindex": "tests/test_llamaindex_integration.py",
 }
 
-_INTEGRATION_FILES: dict[str, str] = {
-    "crewai": "integrations/crewai_endee/tools.py",
-    "langchain": "integrations/langchain_endee/vectorstore.py",
-    "llamaindex": "integrations/llamaindex_endee/vector_store.py",
-}
+
+def _get_test_path(client: str, base_dir: str) -> tuple[str, str]:
+    """
+    Find the test file/dir and the working directory to run pytest in.
+
+    Returns (test_target, cwd) where:
+      - test_target: path to pass to pytest (file or directory)
+      - cwd: working directory for the subprocess
+    """
+    repo_root = get_repo_root(client)
+    repo_tests = repo_root / "tests"
+    if repo_tests.exists():
+        return str(repo_tests), str(repo_root)
+
+    # Fall back to project-level test file
+    return _PROJECT_TEST_FILES.get(client, f"tests/test_{client}_integration.py"), base_dir
+
+
+# ── Multi-file heal prompt ─────────────────────────────────────────────────
 
 _HEAL_PROMPT = """\
 The pytest test suite for the {client} endee integration has failing tests.
 Your job is to fix the integration source code so that ALL tests pass.
 
-Do NOT modify the test file.
+Do NOT modify the test file(s).
 
 ─── FAILING TEST OUTPUT ─────────────────────────────────────────────────────
 {test_output}
 ─────────────────────────────────────────────────────────────────────────────
 
-─── CURRENT INTEGRATION SOURCE ──────────────────────────────────────────────
-{current_code}
+─── CURRENT INTEGRATION SOURCE FILES ────────────────────────────────────────
+{all_files_block}
 ─────────────────────────────────────────────────────────────────────────────
 
 Instructions:
 - Read the test failures carefully to understand what is expected.
-- Fix only the integration code (the source file shown above).
-- Return the COMPLETE corrected file content.
-- No markdown fences, no explanations — only raw Python source.
+- Fix only the integration code (the source files shown above).
+- Return ALL modified files using this EXACT format per file:
+
+==== FILE: <relative_path> ====
+<complete corrected Python source for that file>
+
+Only include files you actually modified.
+No markdown fences, no explanations — only the output in the format above.
 """
 
 
-def _run_pytest(test_file: str, base_dir: str = ".") -> tuple[bool, str]:
-    """Run pytest on a single test file. Returns (passed, full_output)."""
+def _build_files_block(sources: dict[str, str]) -> str:
+    parts = []
+    for rel_path, content in sorted(sources.items()):
+        parts.append(f"── FILE: {rel_path} ──\n{content}\n")
+    return "\n".join(parts)
+
+
+def _parse_multi_file_response(raw: str) -> dict[str, str]:
+    """Parse Claude's multi-file response into {rel_path: code}."""
+    raw = re.sub(r"^```(?:python)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw)
+
+    files: dict[str, str] = {}
+    parts = re.split(r"={4,}\s*FILE:\s*(.+?)\s*={4,}", raw)
+
+    i = 1
+    while i < len(parts) - 1:
+        rel_path = parts[i].strip()
+        code = parts[i + 1].strip()
+        code = re.sub(r"^```(?:python)?\s*", "", code)
+        code = re.sub(r"\s*```$", "", code)
+        if rel_path and code:
+            files[rel_path] = code
+        i += 2
+
+    return files
+
+
+def _run_pytest(test_target: str, cwd: str) -> tuple[bool, str]:
+    """Run pytest on a test file or directory. Returns (passed, full_output)."""
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", test_file, "-v", "--tb=short", "--no-header"],
+        [sys.executable, "-m", "pytest", test_target, "-v", "--tb=short", "--no-header"],
         capture_output=True,
         text=True,
-        cwd=base_dir,
+        cwd=cwd,
     )
     output = result.stdout + result.stderr
     return result.returncode == 0, output
 
 
 def _heal(client: str, test_output: str, base_dir: str) -> None:
-    """Ask Claude to fix the integration source and write the fix to disk."""
-    src_path = Path(base_dir) / _INTEGRATION_FILES[client]
-    current_code = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
+    """Ask Claude to fix all integration source files and write fixes to disk."""
+    sources = read_all_sources(client)
+    repo_root = get_repo_root(client)
 
     prompt = _HEAL_PROMPT.format(
         client=client,
         test_output=test_output,
-        current_code=current_code,
+        all_files_block=(
+            _build_files_block(sources) if sources
+            else "(no source files found)"
+        ),
     )
 
     logger.info("[test_heal][%s] Asking Claude to heal failing tests …", client)
-    fixed_code = call_claude(prompt)
+    raw = call_claude(prompt)
 
-    # Strip markdown fences
-    fixed_code = re.sub(r"^```(?:python)?\s*", "", fixed_code.strip())
-    fixed_code = re.sub(r"\s*```$", "", fixed_code)
+    updated_files = _parse_multi_file_response(raw)
 
-    src_path.parent.mkdir(parents=True, exist_ok=True)
-    src_path.write_text(fixed_code, encoding="utf-8")
-    logger.info("[test_heal][%s] Heal applied (%d chars).", client, len(fixed_code))
+    if not updated_files and len(sources) == 1:
+        # Fallback for single-file repos
+        only_path = list(sources.keys())[0]
+        code = re.sub(r"^```(?:python)?\s*", "", raw.strip())
+        code = re.sub(r"\s*```$", "", code)
+        updated_files = {only_path: code}
+
+    for rel_path, code in updated_files.items():
+        abs_path = repo_root / rel_path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.write_text(code, encoding="utf-8")
+        logger.info("[test_heal][%s] Heal applied to %s (%d chars).", client, rel_path, len(code))
 
 
 def _test_and_heal_one(client: str, base_dir: str = ".") -> dict:
     """Run test → heal loop for a single client."""
-    test_file = _TEST_FILES[client]
+    test_target, cwd = _get_test_path(client, base_dir)
     passed = False
     final_output = ""
 
@@ -105,7 +164,7 @@ def _test_and_heal_one(client: str, base_dir: str = ".") -> dict:
         label = "Initial run" if is_first else f"Heal round {round_num}"
         logger.info("[test_heal][%s] %s …", client, label)
 
-        passed, output = _run_pytest(test_file, base_dir)
+        passed, output = _run_pytest(test_target, cwd)
         final_output = output
 
         if passed:
@@ -157,7 +216,9 @@ def run_and_heal_all(
           "llamaindex":{ … },
         }
     """
-    targets = scope or list(_TEST_FILES.keys())
+    from ..integration_config import all_clients
+
+    targets = scope or all_clients()
     results: dict[str, dict] = {}
 
     for client in targets:

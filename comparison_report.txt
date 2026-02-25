@@ -1,184 +1,76 @@
 
 PACKAGE : endee
-v1      : 0.1.9
-v2      : 0.1.10
+v1      : 0.1.13
+v2      : 0.1.14
 ==================================================
 📄 LINE BY LINE CODE DIFF
 ==================================================
 
-📄 endee/endee.py
-                     token=self.token,
-                     url=self.base_url,
-                     version=self.version,
-➖                  params=metadata.model_dump(by_alias=True),
-➕                  params=metadata.dict(by_alias=True),
-                     session_client_manager=self.session_manager,
-                 )
-             else:
-                     token=self.token,
-                     url=self.base_url,
-                     version=self.version,
-➖                  params=metadata.model_dump(by_alias=True),
-➕                  params=metadata.dict(by_alias=True),
-                     session_client_manager=self.client_manager,
-                 )
+📄 endee/constants.py
+             BINARY2: Binary vectors (1 bit per dimension)
+             FLOAT16: 16-bit floating point
+             FLOAT32: 32-bit floating point
+➖          INT16D: 16-bit integer
+➖          INT8D: 8-bit integer
+➕          INT16: 16-bit integer
+➕          INT8: 8-bit integer
+         """
      
+         BINARY2 = "binary"
+         FLOAT16 = "float16"
+         FLOAT32 = "float32"
+➖      INT16D = "int16d"
+➖      INT8D = "int8d"
+➕      INT16 = "int16"
+➕      INT8 = "int8"
+     
+     
+     # Checksum Value while creating an index
+     
+     # Supported Types
+     # List of precision types supported by the vector database
+➖  PRECISION_TYPES_SUPPORTED = ["binary", "float16", "float32", "int16d", "int8d"]
+➕  PRECISION_TYPES_SUPPORTED = ["binary", "float16", "float32", "int16", "int8"]
+     
+     # Distance metric types
+     COSINE = "cosine"  # Cosine similarity (normalized dot product)
 
-📄 endee/schema.py
-     import sys
-     from typing import Any, Dict, List, Optional, Union
-     
-➖  from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-➕  from pydantic import BaseModel, Field, root_validator, validator
-     
-     from .constants import (
-         DEFAULT_EF_SEARCH,
-     class VectorItem(BaseModel):
-         """Model for a single vector item in an upsert operation."""
-     
-➖      id: str = Field(..., min_length=1)
-➕      id: str
-         vector: List[float]
-         meta: Optional[Dict[str, Any]] = Field(default_factory=dict)
-         filter: Optional[Dict[str, Any]] = Field(default_factory=dict)
-         sparse_indices: Optional[List[int]] = None
-         sparse_values: Optional[List[float]] = None
-     
-➖      @model_validator(mode="after")
-➖      def validate_sparse_data(self) -> "VectorItem":
-➖          if (self.sparse_indices is None) != (self.sparse_values is None):
-➕      @validator("id")
-➕      @classmethod
-➕      def validate_id(cls, v: str) -> str:
-➕          if len(v) < 1:
-➕              raise ValueError("id must not be empty")
-➕          return v
-➕  
-➕      @root_validator
-➕      @classmethod
-➕      def validate_sparse_data(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-➕          sparse_indices = values.get("sparse_indices")
-➕          sparse_values = values.get("sparse_values")
-➕  
-➕          if (sparse_indices is None) != (sparse_values is None):
-                 raise ValueError(
-                     "Both sparse_indices and sparse_values must be provided together"
-                 )
-➖          if self.sparse_indices is not None and len(self.sparse_indices) != len(
-➖              self.sparse_values
-➖          ):
-➕          if sparse_indices is not None and len(sparse_indices) != len(sparse_values):
-                 raise ValueError("sparse_indices and sparse_values must match in length")
-➖          return self
-➕          return values
-     
-     
-     class QueryRequest(BaseModel):
-         sparse_indices: Optional[List[int]] = None
-         sparse_values: Optional[List[float]] = None
-     
-➖      @model_validator(mode="after")
-➖      def validate_query_type(self) -> "QueryRequest":
-➖          has_dense = self.vector is not None
-➖          has_sparse = self.sparse_indices is not None or self.sparse_values is not None
-➕      @root_validator
-➕      @classmethod
-➕      def validate_query_type(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-➕          vector = values.get("vector")
-➕          sparse_indices = values.get("sparse_indices")
-➕          sparse_values = values.get("sparse_values")
-➕  
-➕          has_dense = vector is not None
-➕          has_sparse = sparse_indices is not None or sparse_values is not None
-     
-             if not has_dense and not has_sparse:
-                 raise ValueError(
-                     " must be provided."
-                 )
-     
-➖          if (self.sparse_indices is None) != (self.sparse_values is None):
-➕          if (sparse_indices is None) != (sparse_values is None):
-                 raise ValueError(
-                     "Both sparse_indices and sparse_values must be provided together"
-                 )
-     
-➖          if self.sparse_indices is not None and len(self.sparse_indices) != len(
-➖              self.sparse_values
-➖          ):
-➕          if sparse_indices is not None and len(sparse_indices) != len(sparse_values):
-                 raise ValueError("sparse_indices and sparse_values must match in length")
-     
-➖          return self
-➕          return values
-     
-     
-     class IndexCreateRequest(BaseModel):
-         version: Optional[int] = None
-         sparse_dim: int = Field(default=0, ge=0, le=sys.maxsize)
-     
-➖      @field_validator("name")
-➕      @validator("name")
-         @classmethod
-         def validate_name(cls, v: str) -> str:
-             if not re.match(r"^[a-zA-Z0-9_]+$", v):
-                 )
-             return v
-     
-➖      @field_validator("space_type")
-➕      @validator("space_type")
-         @classmethod
-         def validate_space_type(cls, v: str) -> str:
-             v = v.lower()
-                 )
-             return v
-     
-➖      @field_validator("precision")
-➕      @validator("precision")
-         @classmethod
-         def validate_precision(cls, v: Union[str, Precision]) -> Union[str, Precision]:
-             if isinstance(v, Precision):
-     class IndexMetadata(BaseModel):
-         """Model for index metadata returned by the server."""
-     
-➖      model_config = ConfigDict(populate_by_name=True)
-➕      class Config:
-➕          allow_population_by_field_name = True
-     
-         name: Optional[str] = Field(None, alias="name")
-         lib_token: str
+📄 endee/endee.py
+             space_type: str,
+             M: int = DEFAULT_M,
+             ef_con: int = DEFAULT_EF_CON,
+➖          precision: str | Precision = Precision.INT8D,
+➕          precision: str | Precision = Precision.INT8,
+             version: int = None,
+             sparse_dim: int = DEFAULT_SPARSE_DIMENSION,
+         ):
+                     Higher values improve index quality but slow construction.
+                     Default: DEFAULT_EF_CON
+                 precision: Vector precision type (Precision.BINARY2,
+➖                  Precision.INT8D, Precision.INT16D, Precision.FLOAT16,
+➖                  Precision.FLOAT32). Default: Precision.INT8D
+➕                  Precision.INT8, Precision.INT16, Precision.FLOAT16,
+➕                  Precision.FLOAT32). Default: Precision.INT8
+                 version: API version (optional, uses client version if not specified)
+                 sparse_dim: Sparse vector dimensionality. Set to 0 for dense-only.
+                     Default: DEFAULT_SPARSE_DIMENSION
 
 📄 setup.py
      setup(
          # Package Metadata
          name="endee",
-➖      version="0.1.9",
-➕      version="0.1.10",
+➖      version="0.1.13",
+➕      version="0.1.14",
          author="Endee Labs",
          author_email="dev@endee.io",
          description=(
-             "numpy>=2.2.4",  # Array operations and vector normalization
-             "msgpack>=1.1.0",  # Efficient binary serialization
-             "orjson>=3.11.5",  # Ultra-fast JSON serialization/deserialization
-➖          "pydantic>=2.0.0",  # Data validation and settings management
-➕          "pydantic==1.10.26",  # Data validation and settings management
-         ],
-         # Python Version Requirements
-         python_requires=">=3.6",
 ==================================================
 🔍 CHANGED FUNCTION SIGNATURES
 ==================================================
-(NEW = added in v0.1.10 | REMOVED = absent in v0.1.10 compared to v0.1.9)
-
-📁 endee/schema.py
-  ✅ NEW (v0.1.10):     def validate_id(cls, v)
-  ✏️  CHANGED:
-      v0.1.9: def validate_query_type(self)
-      v0.1.10: def validate_query_type(cls, values)
-  ✏️  CHANGED:
-      v0.1.9: def validate_sparse_data(self)
-      v0.1.10: def validate_sparse_data(cls, values)
+(NEW = added in v0.1.14 | REMOVED = absent in v0.1.14 compared to v0.1.13)
+No function signature changes found.
 ==================================================
 📦 DEPENDENCIES COMPARISON
 ==================================================
-(Added = new in v0.1.10 | Removed = absent in v0.1.10 compared to v0.1.9)
+(Added = new in v0.1.14 | Removed = absent in v0.1.14 compared to v0.1.13)
 No dependency changes found.

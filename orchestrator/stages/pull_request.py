@@ -20,16 +20,11 @@ import re
 import subprocess
 from pathlib import Path
 
+from ..integration_config import get_repo_root, get_source_dir, get_all_source_files
 from ..utils.claude_cli import call_claude
 from ..utils.git_utils import commit_and_push
 
 logger = logging.getLogger(__name__)
-
-_INTEGRATION_FILES: dict[str, str] = {
-    "crewai": os.getenv("CREWAI_REPO_PATH", "integrations/crewai_endee") + "/tools.py",
-    "langchain": os.getenv("LANGCHAIN_REPO_PATH", "integrations/langchain_endee") + "/vectorstore.py",
-    "llamaindex": os.getenv("LLAMAINDEX_REPO_PATH", "integrations/llamaindex_endee") + "/vector_store.py",
-}
 
 _REPO_ENV: dict[str, str] = {
     "crewai": "CREWAI_REPO",
@@ -121,6 +116,22 @@ def _open_pr_with_gh(
     return url
 
 
+def _get_changed_files(client: str) -> list[str]:
+    """
+    Get the list of all source files (relative to repo root) that should be
+    staged for the commit.
+    """
+    repo_root = get_repo_root(client)
+    source_files = get_all_source_files(client)
+    rel_paths = []
+    for f in source_files:
+        try:
+            rel_paths.append(str(f.relative_to(repo_root)))
+        except ValueError:
+            rel_paths.append(f.name)
+    return rel_paths
+
+
 def create_prs(
     branch: str,
     analysis: dict,
@@ -146,7 +157,9 @@ def create_prs(
           …
         }
     """
-    targets = scope or list(_INTEGRATION_FILES.keys())
+    from ..integration_config import all_clients
+
+    targets = scope or all_clients()
     results: dict[str, dict] = {}
 
     version_to = analysis.get("version_to", "latest")
@@ -159,20 +172,19 @@ def create_prs(
             results[client] = {"skipped": True, "reason": "Tests failed", "url": None}
             continue
 
-        repo_path = str(Path(base_dir) / Path(_INTEGRATION_FILES[client]).parent)
-        integration_file = _INTEGRATION_FILES[client]
+        repo_root = get_repo_root(client)
+        changed_files = _get_changed_files(client)
 
         # 1. Commit & push
         commit_msg = (
             f"chore: propagate endee {version_to} API changes\n\n"
-            f"Added prefilter_cardinality_threshold and filter_boost_percentage "
-            f"parameters.\nAuto-committed by Integration Automation Orchestrator."
+            f"Auto-committed by Integration Automation Orchestrator."
         )
         pushed = commit_and_push(
-            local_path=base_dir,
+            local_path=str(repo_root),
             branch_name=branch,
             commit_message=commit_msg,
-            files=[integration_file],
+            files=changed_files,
         )
         if not pushed:
             results[client] = {"skipped": False, "url": None, "error": "git push failed"}
@@ -185,7 +197,7 @@ def create_prs(
         # 3. Open PR with gh CLI
         try:
             url = _open_pr_with_gh(
-                repo_path=base_dir,
+                repo_path=str(repo_root),
                 branch=branch,
                 title=pr_content["title"],
                 body=pr_content["body"],
