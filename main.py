@@ -86,14 +86,122 @@ def compare_code_diff(files_v1: dict, files_v2: dict) -> str:
     return "\n".join(lines)
 
 
-def extract_functions(source: str) -> dict:
-    functions = {}
+def extract_classes(source: str) -> dict:
+    """Returns {class_name: [base_names]} for every class in source."""
+    classes = {}
     try:
         tree = ast.parse(source)
         for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                bases = []
+                for base in node.bases:
+                    if isinstance(base, ast.Name):
+                        bases.append(base.id)
+                    elif isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
+                        bases.append(f"{base.value.id}.{base.attr}")
+                classes[node.name] = bases
+    except Exception:
+        pass
+    return classes
+
+
+def extract_constants(source: str) -> set:
+    """Returns set of module-level ALL_CAPS constant names."""
+    constants = set()
+    try:
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id.isupper():
+                        constants.add(target.id)
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name) and node.target.id.isupper():
+                    constants.add(node.target.id)
+    except Exception:
+        pass
+    return constants
+
+
+def compare_structural_changes(files_v1: dict, files_v2: dict, v1: str = "", v2: str = "") -> str:
+    v1_label = f"v{v1}" if v1 else "v1"
+    v2_label = f"v{v2}" if v2 else "v2"
+
+    class_added, class_removed = [], []
+    const_added, const_removed = [], []
+
+    for filename in sorted(set(files_v1) | set(files_v2)):
+        c1 = extract_classes(files_v1.get(filename, ""))
+        c2 = extract_classes(files_v2.get(filename, ""))
+        for cls in sorted(set(c2) - set(c1)):
+            class_added.append(f"{cls}  [{filename}]")
+        for cls in sorted(set(c1) - set(c2)):
+            class_removed.append(f"{cls}  [{filename}]")
+
+        k1 = extract_constants(files_v1.get(filename, ""))
+        k2 = extract_constants(files_v2.get(filename, ""))
+        for k in sorted(k2 - k1):
+            const_added.append(f"{k}  [{filename}]")
+        for k in sorted(k1 - k2):
+            const_removed.append(f"{k}  [{filename}]")
+
+    lines = ["\n" + "=" * 50, "🏗️  STRUCTURAL CHANGES", "=" * 50]
+    lines.append(f"Comparing {v1_label} → {v2_label}\n")
+
+    if class_added:
+        lines.append(f"✅ NEW CLASSES ({len(class_added)}):")
+        lines.extend(f"   + {c}" for c in sorted(class_added))
+    else:
+        lines.append("✅ NEW CLASSES: none")
+
+    lines.append("")
+
+    if class_removed:
+        lines.append(f"❌ REMOVED CLASSES ({len(class_removed)}):")
+        lines.extend(f"   - {c}" for c in sorted(class_removed))
+    else:
+        lines.append("❌ REMOVED CLASSES: none")
+
+    lines.append("")
+
+    if const_added:
+        lines.append(f"✅ NEW CONSTANTS ({len(const_added)}):")
+        lines.extend(f"   + {c}" for c in sorted(const_added))
+    else:
+        lines.append("✅ NEW CONSTANTS: none")
+
+    lines.append("")
+
+    if const_removed:
+        lines.append(f"❌ REMOVED CONSTANTS ({len(const_removed)}):")
+        lines.extend(f"   - {c}" for c in sorted(const_removed))
+    else:
+        lines.append("❌ REMOVED CONSTANTS: none")
+
+    return "\n".join(lines)
+
+
+def extract_functions(source: str) -> dict:
+    """Returns {qualified_name: signature_str} for every function/method in source."""
+    functions = {}
+    try:
+        tree = ast.parse(source)
+        # Build a parent map so we can resolve class context
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                child._parent = node  # type: ignore[attr-defined]
+
+        for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = [a.arg for a in node.args.args]
-                functions[node.name] = f"def {node.name}({', '.join(args)})"
+                sig  = f"def {node.name}({', '.join(args)})"
+                # Walk up to find enclosing class (if any)
+                parent = getattr(node, "_parent", None)
+                if isinstance(parent, ast.ClassDef):
+                    qualified = f"{parent.name}.{node.name}"
+                else:
+                    qualified = node.name
+                functions[qualified] = sig
     except Exception:
         pass
     return functions
@@ -102,24 +210,66 @@ def extract_functions(source: str) -> dict:
 def compare_function_signatures(files_v1: dict, files_v2: dict, v1: str = "", v2: str = "") -> str:
     v1_label = f"v{v1}" if v1 else "v1"
     v2_label = f"v{v2}" if v2 else "v2"
-    lines = ["\n" + "=" * 50, "🔍 CHANGED FUNCTION SIGNATURES", "=" * 50]
-    lines.append(f"(NEW = added in {v2_label} | REMOVED = absent in {v2_label} compared to {v1_label})")
+
+    # Collect per-file diffs
+    per_file = {}
+    all_added, all_removed, all_changed = [], [], []
     for filename in sorted(set(files_v1) | set(files_v2)):
         f1 = extract_functions(files_v1.get(filename, ""))
         f2 = extract_functions(files_v2.get(filename, ""))
-        new     = set(f2) - set(f1)   # in v2 but not v1
-        removed = set(f1) - set(f2)   # in v1 but not v2
-        changed = {f for f in set(f1) & set(f2) if f1[f] != f2[f]}
+        new     = sorted(set(f2) - set(f1))
+        removed = sorted(set(f1) - set(f2))
+        changed = sorted(f for f in set(f1) & set(f2) if f1[f] != f2[f])
         if new or removed or changed:
-            lines.append(f"\n📁 {filename}")
-            for f in sorted(new):
-                lines.append(f"  ✅ NEW ({v2_label}):     {f2[f]}")
-            for f in sorted(removed):
-                lines.append(f"  ❌ REMOVED ({v2_label}): {f1[f]}")
-            for f in sorted(changed):
-                lines.append(f"  ✏️  CHANGED:\n      {v1_label}: {f1[f]}\n      {v2_label}: {f2[f]}")
-    if len(lines) == 4:
-        lines.append("No function signature changes found.")
+            per_file[filename] = (f1, f2, new, removed, changed)
+            all_added.extend(f"{f}  [{filename}]" for f in new)
+            all_removed.extend(f"{f}  [{filename}]" for f in removed)
+            all_changed.extend(f"{f}  [{filename}]" for f in changed)
+
+    lines = ["\n" + "=" * 50, "🔍 FUNCTION CHANGES SUMMARY", "=" * 50]
+    lines.append(f"Comparing {v1_label} → {v2_label}\n")
+
+    if all_added:
+        lines.append(f"✅ ADDED ({len(all_added)} function{'s' if len(all_added) != 1 else ''}):")
+        lines.extend(f"   + {f}" for f in sorted(all_added))
+    else:
+        lines.append("✅ ADDED: none")
+
+    lines.append("")
+
+    if all_removed:
+        lines.append(f"❌ REMOVED ({len(all_removed)} function{'s' if len(all_removed) != 1 else ''}):")
+        lines.extend(f"   - {f}" for f in sorted(all_removed))
+    else:
+        lines.append("❌ REMOVED: none")
+
+    lines.append("")
+
+    if all_changed:
+        lines.append(f"✏️  SIGNATURE CHANGED ({len(all_changed)} function{'s' if len(all_changed) != 1 else ''}):")
+        lines.extend(f"   ~ {f}" for f in sorted(all_changed))
+    else:
+        lines.append("✏️  SIGNATURE CHANGED: none")
+
+    if not per_file:
+        lines.append("\nNo function changes found.")
+        return "\n".join(lines)
+
+    # Per-file detail
+    lines.append("\n" + "-" * 50)
+    lines.append("📂 DETAILS BY FILE")
+    lines.append("-" * 50)
+    for filename, (f1, f2, new, removed, changed) in per_file.items():
+        lines.append(f"\n📁 {filename}")
+        for f in new:
+            lines.append(f"  ✅ ADDED:   {f2[f]}")
+        for f in removed:
+            lines.append(f"  ❌ REMOVED: {f1[f]}")
+        for f in changed:
+            lines.append(f"  ✏️  CHANGED:")
+            lines.append(f"      {v1_label}: {f1[f]}")
+            lines.append(f"      {v2_label}: {f2[f]}")
+
     return "\n".join(lines)
 
 
@@ -168,35 +318,25 @@ def run_comparison(channel: str, v1: str = VERSION_1, v2: str = VERSION_2):
 
         # Step 3: Run comparisons
         slack_client.chat_postMessage(channel=channel, text="🔍 Comparing changes...")
-        header      = f"\nPACKAGE : {PACKAGE_NAME}\nv1      : {v1}\nv2      : {v2}\n"
-        diff_report = compare_code_diff(files_v1, files_v2)
-        func_report = compare_function_signatures(files_v1, files_v2, v1, v2)
-        deps_report = compare_dependencies(folder_v1, folder_v2, v1, v2)
+        header       = f"\nPACKAGE : {PACKAGE_NAME}\nv1      : {v1}\nv2      : {v2}\n"
+        struct_report = compare_structural_changes(files_v1, files_v2, v1, v2)
+        func_report   = compare_function_signatures(files_v1, files_v2, v1, v2)
+        deps_report   = compare_dependencies(folder_v1, folder_v2, v1, v2)
 
         # Step 4: Save report
-        full_report = header + diff_report + func_report + deps_report
+        full_report = header + struct_report + func_report + deps_report
         with open(REPORT_FILE, "w") as f:
             f.write(full_report)
 
-        # Step 5: Send full report to Slack as plain text (chunked to stay within 4000-char limit)
-        slack_client.chat_postMessage(
-            channel=channel,
-            text=(
-                f"✅ *Comparison Complete!*\n"
-                f"📦 Package: `{PACKAGE_NAME}`\n"
-                f"🔁 Versions: `{v1}` → `{v2}`\n"
-                f"📄 Full report saved to: `{REPORT_FILE}`"
-            )
-        )
-
+        # Step 5: Send to Slack (chunked to stay within 4000-char limit)
         def send_in_chunks(text: str):
             chunk_size = 3900
             for i in range(0, len(text), chunk_size):
                 slack_client.chat_postMessage(channel=channel, text=text[i:i + chunk_size])
 
+        send_in_chunks(struct_report)
         send_in_chunks(func_report)
         send_in_chunks(deps_report)
-        send_in_chunks(diff_report)
 
     except Exception as e:
         slack_client.chat_postMessage(channel=channel, text=f"❌ Error: {str(e)}")
