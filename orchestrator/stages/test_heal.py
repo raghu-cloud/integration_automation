@@ -334,7 +334,7 @@ def _heal(client: str, test_output: str, base_dir: str) -> None:
     )
 
     logger.info("[test_heal][%s] Asking Claude to heal failing tests (prompt=%d chars) …", client, len(prompt))
-    raw = call_claude(prompt, timeout=600)
+    raw = call_claude(prompt, timeout=180)
 
     updated_files = _parse_multi_file_response(raw)
 
