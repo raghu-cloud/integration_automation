@@ -436,7 +436,7 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
 
         logger.info("[transform][%s] Calling Claude CLI to update tests (prompt=%d chars) …", client, len(test_prompt))
         try:
-            raw_tests = call_claude(test_prompt, timeout=600)
+            raw_tests = call_claude(test_prompt, timeout=180)
             updated_test_files = _parse_multi_file_response(raw_tests)
 
             if not updated_test_files and len(test_sources) == 1:

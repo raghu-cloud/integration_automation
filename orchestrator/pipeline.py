@@ -210,18 +210,20 @@ def run_pipeline(
     # ── Test Results Report ───────────────────────────────────────────────
     _notify(_build_test_report(test_results))
 
-    all_passed = all(tr["passed"] for tr in test_results.values())
+    passing = [c for c, tr in test_results.items() if tr["passed"]]
+    failing = [c for c, tr in test_results.items() if not tr["passed"]]
 
-    # ── Stage 4: Create PRs ──────────────────────────────────────────────────
-    if not all_passed:
-        failing = [c for c, tr in test_results.items() if not tr["passed"]]
+    if failing:
         _notify(
-            f"⚠️ *Stage 4/4 — Skipped PR creation* "
-            f"(failing integrations: {', '.join(failing)})"
+            f"⚠️ Tests failed for: {', '.join(failing)}. "
+            f"Creating PRs for passing clients only."
         )
         results["errors"].append(
-            f"PRs skipped — tests still failing for: {', '.join(failing)}"
+            f"Tests still failing for: {', '.join(failing)}"
         )
+
+    if not passing:
+        _notify("❌ *Stage 4/4 — Skipped PR creation* (all tests failed)")
         return results
 
     _notify("🚀 *Stage 4/4 — Creating GitHub Pull Requests* …")

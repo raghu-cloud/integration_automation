@@ -20,7 +20,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from ..integration_config import get_repo_root, get_source_dir, get_all_source_files
+from ..integration_config import get_repo_root, get_source_dir, get_all_source_files, get_all_test_files
 from ..utils.claude_cli import call_claude
 from ..utils.git_utils import commit_and_push
 
@@ -118,13 +118,14 @@ def _open_pr_with_gh(
 
 def _get_changed_files(client: str) -> list[str]:
     """
-    Get the list of all source files (relative to repo root) that should be
-    staged for the commit.
+    Get the list of all source and test files (relative to repo root) that
+    should be staged for the commit.
     """
     repo_root = get_repo_root(client)
     source_files = get_all_source_files(client)
+    test_files = get_all_test_files(client)
     rel_paths = []
-    for f in source_files:
+    for f in source_files + test_files:
         try:
             rel_paths.append(str(f.relative_to(repo_root)))
         except ValueError:
@@ -175,7 +176,12 @@ def create_prs(
         repo_root = get_repo_root(client)
         changed_files = _get_changed_files(client)
 
-        # 1. Commit & push
+        # 1. Ensure the branch exists and is checked out
+        from ..utils.git_utils import create_branch
+        # Try to create the branch; if it already exists, just check it out
+        create_branch(str(repo_root), branch_name=branch)
+
+        # 2. Commit & push
         commit_msg = (
             f"chore: propagate endee {version_to} API changes\n\n"
             f"Auto-committed by Integration Automation Orchestrator."

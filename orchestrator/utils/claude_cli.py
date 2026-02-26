@@ -67,6 +67,7 @@ def call_claude(
         )
 
     base_flags = extra_flags or []
+    tmp_path = None
 
     if len(prompt) <= _ARG_LIMIT:
         # Short prompt → pass directly as a positional argument
@@ -101,6 +102,12 @@ def call_claude(
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Claude CLI timed out after {timeout}s.")
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
 
     if result.returncode != 0:
         logger.error("[claude_cli] stderr:\n%s", result.stderr)

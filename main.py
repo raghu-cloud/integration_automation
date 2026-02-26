@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
-import os, ast, difflib, shutil, requests, tarfile, zipfile, logging
+import os, ast, difflib, shutil, requests, tarfile, zipfile, logging, time, threading
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
@@ -13,6 +13,27 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+
+# ── Slack event deduplication ──────────────────────────────────────────────────
+# Slack retries events after ~3s if it doesn't get a fast response.
+# We track seen event IDs (TTL=60s) to prevent duplicate pipeline triggers.
+_seen_events: dict[str, float] = {}
+_seen_lock = threading.Lock()
+_EVENT_TTL = 60  # seconds
+
+
+def _is_duplicate_event(event_id: str) -> bool:
+    """Return True if this event_id was already processed recently."""
+    now = time.time()
+    with _seen_lock:
+        # Prune expired entries
+        expired = [k for k, t in _seen_events.items() if now - t > _EVENT_TTL]
+        for k in expired:
+            del _seen_events[k]
+        if event_id in _seen_events:
+            return True
+        _seen_events[event_id] = now
+    return False
 
 # ── Pipeline orchestrator ──────────────────────────────────────────────────────
 try:
@@ -57,7 +78,7 @@ def download_package(package: str, version: str) -> Path:
 
     if filename.suffix == ".gz":
         with tarfile.open(filename, "r:gz") as tar:
-            tar.extractall(folder)
+            tar.extractall(folder, filter="data")
     elif filename.suffix == ".whl":
         with zipfile.ZipFile(filename, "r") as z:
             z.extractall(folder)
@@ -232,6 +253,12 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     # Slack URL verification
     if body.get("type") == "url_verification":
         return {"challenge": body["challenge"]}
+
+    # Deduplicate retried events
+    event_id = body.get("event_id", "")
+    if event_id and _is_duplicate_event(event_id):
+        logger.debug("[slack] Skipping duplicate event %s", event_id)
+        return {"status": "ok"}
 
     event  = body.get("event", {})
     if event.get("type") == "message":

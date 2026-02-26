@@ -58,13 +58,23 @@ def create_branch(local_path: str, branch_name: str) -> bool:
     """
     Create and checkout a new local branch.
 
-    Returns True on success, False if the branch already exists or git fails.
+    If the branch already exists, checks it out instead.
+    Returns True on success, False if git fails.
     """
     logger.info("[git] Creating branch '%s' in %s …", branch_name, local_path)
     code, out, err = _run(
         ["git", "checkout", "-b", branch_name], cwd=local_path
     )
     if code != 0:
+        if "already exists" in err:
+            logger.info("[git] Branch '%s' already exists — checking out.", branch_name)
+            code, out, err = _run(
+                ["git", "checkout", branch_name], cwd=local_path
+            )
+            if code != 0:
+                logger.error("[git] Checkout failed: %s", err)
+                return False
+            return True
         logger.error("[git] Branch creation failed: %s", err)
         return False
     return True
