@@ -142,32 +142,120 @@ def _parse_multi_file_response(raw: str) -> dict[str, str]:
     Expected format per file:
         ==== FILE: crewai_endee/utils.py ====
         <code>
+
+    Falls back to alternative separators if the primary format isn't found.
     """
     # Strip accidental markdown fences from the whole response
-    raw = re.sub(r"^```(?:python)?\s*", "", raw.strip())
-    raw = re.sub(r"\s*```$", "", raw)
+    stripped = re.sub(r"^```(?:python)?\s*", "", raw.strip())
+    stripped = re.sub(r"\s*```$", "", stripped)
 
-    files: dict[str, str] = {}
-    # Split on the file header markers
+    # ── Strategy 1: ==== FILE: <path> ==== markers (primary) ────────────
+    files = _try_parse_eq_markers(stripped)
+    if files:
+        return files
+
+    # ── Strategy 2: ```python  # FILE: <path>  fenced blocks ───────────
+    files = _try_parse_fenced_blocks(raw.strip())
+    if files:
+        return files
+
+    # ── Strategy 3: --- <path> --- or ## <path> headers ────────────────
+    files = _try_parse_alt_separators(stripped)
+    if files:
+        return files
+
+    # Nothing matched — log a debug snippet so we can diagnose later
+    logger.debug(
+        "[parse] No file markers found. Raw response (first 500 chars):\n%s",
+        raw[:500],
+    )
+    return {}
+
+
+def _try_parse_eq_markers(raw: str) -> dict[str, str]:
+    """Parse using ==== FILE: ... ==== markers."""
     parts = re.split(r"={4,}\s*FILE:\s*(.+?)\s*={4,}", raw)
-
-    # parts[0] is any preamble (should be empty), then alternating:
-    #   parts[1] = filename, parts[2] = code
-    #   parts[3] = filename, parts[4] = code, ...
+    if len(parts) < 3:
+        return {}
+    files: dict[str, str] = {}
     i = 1
     while i < len(parts) - 1:
         rel_path = parts[i].strip()
         code = parts[i + 1].strip()
-        # Strip per-file markdown fences if Claude added them
         code = re.sub(r"^```(?:python)?\s*", "", code)
         code = re.sub(r"\s*```$", "", code)
         if rel_path and code:
-            # Sanitize: remove any leading prose before actual Python code
-            code = _sanitize_code(code)
-            files[rel_path] = code
+            files[rel_path] = _sanitize_code(code)
         i += 2
-
     return files
+
+
+def _try_parse_fenced_blocks(raw: str) -> dict[str, str]:
+    """
+    Parse markdown fenced code blocks that have a file path comment.
+
+    Matches patterns like:
+        ```python
+        # FILE: crewai_endee/utils.py
+        <code>
+        ```
+    """
+    pattern = re.compile(
+        r"```(?:python)?\s*\n"
+        r"\s*#\s*FILE:\s*(.+?)\s*\n"
+        r"(.*?)"
+        r"\n\s*```",
+        re.DOTALL,
+    )
+    files: dict[str, str] = {}
+    for m in pattern.finditer(raw):
+        rel_path = m.group(1).strip()
+        code = m.group(2).strip()
+        if rel_path and code:
+            files[rel_path] = _sanitize_code(code)
+    return files
+
+
+def _try_parse_alt_separators(raw: str) -> dict[str, str]:
+    """
+    Parse using alternative separators Claude sometimes uses:
+      - --- <path> ---
+      - ## <path>
+      - # FILE: <path>
+    """
+    # Try --- path --- separators
+    parts = re.split(r"-{3,}\s*(.+?\.py)\s*-{3,}", raw)
+    if len(parts) >= 3:
+        files: dict[str, str] = {}
+        i = 1
+        while i < len(parts) - 1:
+            rel_path = parts[i].strip()
+            code = parts[i + 1].strip()
+            code = re.sub(r"^```(?:python)?\s*", "", code)
+            code = re.sub(r"\s*```$", "", code)
+            if rel_path and code:
+                files[rel_path] = _sanitize_code(code)
+            i += 2
+        if files:
+            return files
+
+    # Try # FILE: path  or  ## path.py  headers
+    parts = re.split(r"^#{1,2}\s*(?:FILE:\s*)?(.+?\.py)\s*$", raw, flags=re.MULTILINE)
+    if len(parts) >= 3:
+        files = {}
+        i = 1
+        while i < len(parts) - 1:
+            rel_path = parts[i].strip()
+            code = parts[i + 1].strip()
+            code = re.sub(r"^```(?:python)?\s*", "", code)
+            code = re.sub(r"\s*```$", "", code)
+            if rel_path and code:
+                files[rel_path] = _sanitize_code(code)
+            i += 2
+        if files:
+            return files
+
+    return {}
 
 
 def _sanitize_code(code: str) -> str:
@@ -318,41 +406,66 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
     test_files_written = []
 
     if test_sources:
-        # Re-read the updated source files we just wrote
+        # Re-read the updated source files we just wrote.
+        # If the prompt would be too large, only include the files we changed.
         updated_source_contents = read_all_sources(client)
+        source_block = _build_files_block(updated_source_contents)
+        test_block = _build_files_block(test_sources)
+
+        # If combined blocks are too large, trim to only changed files
+        _MAX_PROMPT = 100_000
+        if len(source_block) + len(test_block) > _MAX_PROMPT:
+            logger.info(
+                "[transform][%s] Test-update prompt too large (%d chars); "
+                "trimming to only changed source files.",
+                client,
+                len(source_block) + len(test_block),
+            )
+            changed_sources = {
+                k: v for k, v in updated_source_contents.items()
+                if k in files_written
+            }
+            if changed_sources:
+                source_block = _build_files_block(changed_sources)
+
         test_prompt = _TEST_TRANSFORM_PROMPT.format(
             client=client,
-            updated_source_block=_build_files_block(updated_source_contents),
-            test_files_block=_build_files_block(test_sources),
+            updated_source_block=source_block,
+            test_files_block=test_block,
         )
 
-        logger.info("[transform][%s] Calling Claude CLI to update tests …", client)
-        raw_tests = call_claude(test_prompt)
-        updated_test_files = _parse_multi_file_response(raw_tests)
+        logger.info("[transform][%s] Calling Claude CLI to update tests (prompt=%d chars) …", client, len(test_prompt))
+        try:
+            raw_tests = call_claude(test_prompt, timeout=600)
+            updated_test_files = _parse_multi_file_response(raw_tests)
 
-        if not updated_test_files and len(test_sources) == 1:
-            only_path = list(test_sources.keys())[0]
-            code = re.sub(r"^```(?:python)?\s*", "", raw_tests.strip())
-            code = re.sub(r"\s*```$", "", code)
-            code = _sanitize_code(code)
-            updated_test_files = {only_path: code}
+            if not updated_test_files and len(test_sources) == 1:
+                only_path = list(test_sources.keys())[0]
+                code = re.sub(r"^```(?:python)?\s*", "", raw_tests.strip())
+                code = re.sub(r"\s*```$", "", code)
+                code = _sanitize_code(code)
+                updated_test_files = {only_path: code}
 
-        for rel_path, code in updated_test_files.items():
-            if not _validate_python(code, rel_path):
-                logger.error(
-                    "[transform][%s] SKIPPED writing test %s — not valid Python.",
-                    client, rel_path,
+            for rel_path, code in updated_test_files.items():
+                if not _validate_python(code, rel_path):
+                    logger.error(
+                        "[transform][%s] SKIPPED writing test %s — not valid Python.",
+                        client, rel_path,
+                    )
+                    continue
+                abs_path = repo_root / rel_path
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                abs_path.write_text(code, encoding="utf-8")
+                test_files_written.append(rel_path)
+                logger.info(
+                    "[transform][%s] Updated test file %s (%d chars)",
+                    client,
+                    rel_path,
+                    len(code),
                 )
-                continue
-            abs_path = repo_root / rel_path
-            abs_path.parent.mkdir(parents=True, exist_ok=True)
-            abs_path.write_text(code, encoding="utf-8")
-            test_files_written.append(rel_path)
-            logger.info(
-                "[transform][%s] Updated test file %s (%d chars)",
-                client,
-                rel_path,
-                len(code),
+        except Exception as exc:
+            logger.error(
+                "[transform][%s] Test-update phase failed: %s", client, exc
             )
     else:
         logger.info("[transform][%s] No test files found — skipping test update.", client)

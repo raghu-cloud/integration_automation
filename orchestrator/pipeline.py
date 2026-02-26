@@ -199,16 +199,8 @@ def run_pipeline(
     _notify("🧪 *Stage 3/4 — Running tests (auto-healing on failure)* …")
 
     try:
-        test_results = run_and_heal_all(scope=targets, base_dir=base_dir)
+        test_results = run_and_heal_all(scope=targets, base_dir=base_dir, notify=_notify)
         results["tests"] = test_results
-
-        for client, tr in test_results.items():
-            icon = "✅" if tr["passed"] else "❌"
-            rounds = tr["rounds_used"]
-            _notify(
-                f"  {icon} `{client}` — {tr['summary']} "
-                f"({'first run' if rounds == 1 else f'{rounds} rounds'})"
-            )
     except Exception as exc:
         msg = f"❌ Stage 3 (test) failed: {exc}"
         _notify(msg)
