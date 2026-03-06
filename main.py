@@ -381,14 +381,13 @@ def _run_pipeline_background(
     scope: str,
 ) -> None:
     """
-    Background task that runs the four-stage pipeline and streams progress
+    Background task that runs the three-stage pipeline and streams progress
     back to Slack via chat_postMessage after each stage.
 
     Pipeline:
-      Stage 1 — claude -p  "parse diff → structured JSON"
-      Stage 2 — claude -p  "update crewai/langchain/llamaindex code" (×3 parallel)
-      Stage 3 — pytest → if fail → claude -p "fix it" → retry (up to 3×)
-      Stage 4 — claude -p  "write PR title+body" → gh pr create
+      Stage 1 — Claude subagent → parse diff → structured JSON
+      Stage 2 — Claude subagents → Read/Edit integration files (×N parallel)
+      Stage 3 — pytest → if fail → Claude subagent fixes → retry (up to 3×)
     """
     if _run_pipeline is None:
         slack_client.chat_postMessage(
@@ -432,20 +431,19 @@ def _run_pipeline_background(
             text=msg,
         )
 
+    import asyncio
+
     try:
-        results = _run_pipeline(
-            report_content=report_content,
-            branch=branch,
-            scope=scope,
-            notify=_notify,
+        results = asyncio.run(
+            _run_pipeline(
+                report_content=report_content,
+                branch=branch,
+                scope=scope,
+                notify=_notify,
+            )
         )
 
         # Final summary
-        pr_urls = [
-            pr.get("url")
-            for pr in results.get("prs", {}).values()
-            if pr.get("url")
-        ]
         errors = results.get("errors", [])
         success = results.get("success", False)
 
@@ -454,9 +452,6 @@ def _run_pipeline_background(
             "✅ *Pipeline finished successfully!*" if success
             else "⚠️ *Pipeline finished with errors.*"
         )
-        if pr_urls:
-            summary_lines.append("*Pull Requests:*")
-            summary_lines.extend(f"  • {url}" for url in pr_urls)
         if errors:
             summary_lines.append("*Errors:*")
             summary_lines.extend(f"  • {e}" for e in errors[:5])
@@ -468,8 +463,8 @@ def _run_pipeline_background(
         )
 
         logger.info(
-            "[pipeline] Done. success=%s PRs=%s errors=%s",
-            success, pr_urls, errors,
+            "[pipeline] Done. success=%s errors=%s",
+            success, errors,
         )
 
     except Exception as exc:

@@ -2,38 +2,19 @@
 pipeline.py — Integration Automation Pipeline
 =============================================
 
-Pure-Python orchestrator. No external framework — just four sequential stages
-with a concise progress callback so the caller can stream status to Slack.
+Master orchestrator using true Claude Code subagent architecture.
+Instead of standalone Python stages, we define `AgentDefinition` subagents
+and hand them to a single master agent via the `run_orchestrator` wrapper.
 
-            ┌──────────────────────────────────────────────────────┐
-            │                  PIPELINE FLOW                       │
-            │                                                      │
-            │  Stage 1: Analyze Diff                               │
-            │    claude -p "parse the comparison report…"          │
-            │                                                      │
-            │  Stage 2: Transform  (×3 parallel threads)           │
-            │    claude -p "update crewai code…"                   │
-            │    claude -p "update langchain code…"                │
-            │    claude -p "update llamaindex code…"               │
-            │                                                      │
-            │  Stage 3: Test + Self-Heal  (per integration)        │
-            │    pytest → if fail → claude -p "fix it" → retry     │
-            │                                                      │
-            │  Stage 4: Create PRs  (for every passing client)     │
-            │    claude -p "write PR title + body…"                │
-            │    gh pr create …                                    │
-            └──────────────────────────────────────────────────────┘
+Master Agent:
+  - Guided by the main prompt
+  - Delegates to named subagents (analyzer, transformer, healer)
+  - Uses the `Task` tool for delegation
 
-Usage
------
-    from orchestrator.pipeline import run_pipeline
-
-    results = run_pipeline(
-        report_content = open("comparison_report.txt").read(),
-        branch         = "auto/endee-0.1.13",
-        scope          = ["crewai", "langchain", "llamaindex"],  # or None for all
-        notify         = lambda msg: slack_client.chat_postMessage(channel=ch, text=msg),
-    )
+Subagents:
+  - analyzer:    Parses diffs into structured summaries
+  - transformer: Rewrites integration source code using Read/Edit tools
+  - healer:      Runs pytest and uses Read/Edit/Bash to fix failing tests
 """
 
 from __future__ import annotations
@@ -41,76 +22,116 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from .stages.analyze import analyze_diff
-from .stages.pull_request import create_prs
-from .stages.test_heal import run_and_heal_all
-from .stages.transform import transform_all
+from claude_agent_sdk import AgentDefinition
+
+from .integration_config import all_clients, get_repo_root, get_source_dir
+from .utils.claude_sdk import MODEL_OPUS, MODEL_SONNET, run_orchestrator
 
 logger = logging.getLogger(__name__)
 
-_ALL_CLIENTS = ["llamaindex"]
+
+# ── Subagent Definitions ───────────────────────────────────────────────────
+
+_AGENT_ANALYZER = AgentDefinition(
+    description=(
+        "Analyzes upstream SDK diffs (comparison reports) and identifies "
+        "meaningful API changes, extracting new parameters, types, and defaults."
+    ),
+    prompt=(
+        "You are a senior Python SDK analyst. Your job is to extract every "
+        "meaningful change from the provided comparison report and return a "
+        "concise summary of WHAT changed, WHICH parameters were added, "
+        "and their default values/types. Do not write code."
+    ),
+    model=MODEL_SONNET,
+)
+
+_AGENT_TRANSFORMER = AgentDefinition(
+    description=(
+        "An expert Python engineer that updates integration source code "
+        "folders to support new upstream parameters and API changes."
+    ),
+    prompt=(
+        "You are an expert Python engineer updating downstream SDK integrations. "
+        "Given an analysis of upstream changes: "
+        "1. CD into the provided integration repository. "
+        "2. Add new parameters to index.query() calls and public methods. "
+        "3. Preserve existing defaults to remain backward compatible. "
+        "4. Fix tests if there are test files. "
+        "Use Read/Edit tools to explore and modify the codebase directly."
+    ),
+    tools=["Read", "Edit", "Glob", "Grep", "Bash"],
+    model=MODEL_OPUS,
+)
+
+_AGENT_HEALER = AgentDefinition(
+    description=(
+        "An expert Python test engineer that runs pytest and fixes failing "
+        "tests iteratively using Bash, Read, and Edit tools."
+    ),
+    prompt=(
+        "You are an expert Python test engineer. "
+        "Your task is to CD into an integration repository, run `pytest`, "
+        "read the failure output, and fix the source or test code until ALL "
+        "tests pass. Use Bash to run the tests. Use Read/Edit to fix the files. "
+        "Keep trying until tests pass or you conclude it is impossible."
+    ),
+    tools=["Read", "Edit", "Bash", "Glob", "Grep"],
+    model=MODEL_SONNET,
+)
+
+# ── Master Orchestrator Prompt ─────────────────────────────────────────────
+
+_MASTER_PROMPT_TEMPLATE = """\
+You are the Master Orchestrator for the Integration Update Pipeline.
+Your goal is to update the downstream endee integrations ({scope_csv})
+based on a new upstream Python SDK release.
+
+─── COMPARISON REPORT (UPSTREAM CHANGES) ─────────────────────────────────
+{report}
+─────────────────────────────────────────────────────────────────────────
+
+You have three specialized subagents available via the Task tool:
+1. `analyzer`:    Extracts a concise summary and list of new parameters from the diff.
+2. `transformer`: Edits the integration repos to support the new features.
+3. `healer`:      Runs tests and fixes any breakage.
+
+INSTRUCTIONS:
+Step 1: Delegate the 'comparison report' to the `analyzer` subagent to get a
+        clear summary of the new parameters and changes.
+        
+Step 2: For EACH integration in scope ({scope_csv}), note its Repo Path and Source Dir:
+{client_contexts}
+
+Step 3: For each integration, delegate a task to the `transformer` subagent:
+        - Provide the analyzer's summary.
+        - Give it the exact Repo Path so it knows where to cd.
+        - Tell it to update the python files in the Source Dir.
+        (Do them one by one).
+
+Step 4: Once all integrations are transformed, delegate a task to the `healer`
+        subagent for EACH integration to run `pytest` and fix any failures.
+        Make sure the healer runs from the Repo Path.
+
+Step 5: Summarize the final pass/fail test status for every integration.
+"""
 
 
-def _build_test_report(test_results: dict) -> str:
-    """Build a formatted Slack test-results report."""
-    lines = ["📊 *Test Results Report*", ""]
-
-    # Header
-    lines.append(f"{'Framework':<14} {'Passed':>7} {'Failed':>7} {'Errors':>7} {'Rounds':>7}  Status")
-    lines.append("─" * 68)
-
-    total_passed = total_failed = total_errors = 0
-
-    for client, tr in test_results.items():
-        p = tr.get("passed_count", 0)
-        f = tr.get("failed_count", 0)
-        e = tr.get("error_count", 0)
-        rounds = tr.get("rounds_used", 0)
-        icon = "✅" if tr["passed"] else "❌"
-        total_passed += p
-        total_failed += f
-        total_errors += e
-        lines.append(f"{icon} {client:<12} {p:>7} {f:>7} {e:>7} {rounds:>7}")
-
-    lines.append("─" * 68)
-    lines.append(f"{'Total':<14} {total_passed:>7} {total_failed:>7} {total_errors:>7}")
-    lines.append("")
-
-    # Add failure details (truncated) for any failing frameworks
-    failing = {c: tr for c, tr in test_results.items() if not tr["passed"]}
-    if failing:
-        lines.append("*Failure Details:*")
-        for client, tr in failing.items():
-            output = tr.get("output", "")
-            # Extract just the FAILURES section if available
-            failure_section = ""
-            if "FAILURES" in output:
-                start = output.index("FAILURES")
-                failure_section = output[start:start + 800]
-            elif "ERRORS" in output:
-                start = output.index("ERRORS")
-                failure_section = output[start:start + 800]
-            else:
-                # Last 400 chars as fallback
-                failure_section = output[-400:]
-
-            lines.append(f"\n`{client}` — {tr.get('summary', 'failed')}")
-            lines.append(f"```{failure_section.strip()}```")
-
+def _build_client_contexts(scope: list[str]) -> str:
+    """Build a string describing the paths for each integration in scope."""
+    lines = []
+    for client in scope:
+        repo = get_repo_root(client)
+        src = get_source_dir(client)
+        lines.append(
+            f"  - Client: {client}\n"
+            f"    Repo Path: {repo}\n"
+            f"    Source Dir: {src.name}"
+        )
     return "\n".join(lines)
 
 
-def _parse_scope(scope: str | list[str] | None) -> list[str]:
-    """Normalise the scope argument into a list of client names."""
-    if scope is None or scope == "all":
-        return _ALL_CLIENTS
-    if isinstance(scope, list):
-        return [s.strip().lower() for s in scope if s.strip()]
-    # Comma-separated string: "crewai,langchain"
-    return [s.strip().lower() for s in str(scope).split(",") if s.strip()]
-
-
-def run_pipeline(
+async def run_pipeline(
     report_content: str,
     branch: str = "auto/endee-update",
     scope: str | list[str] | None = None,
@@ -118,142 +139,85 @@ def run_pipeline(
     notify: Callable[[str], None] | None = None,
 ) -> dict:
     """
-    Run the full four-stage integration automation pipeline.
+    Run the integration automation pipeline via Claude Code subagents.
 
     Args:
         report_content: Raw text from comparison_report.txt.
-        branch:         Git branch name for commits and PRs.
-        scope:          Which integrations to touch. Accepts:
-                          - None / "all"              → all three clients
-                          - "crewai"                  → single client
-                          - "crewai,langchain"        → comma-separated list
-                          - ["crewai", "llamaindex"]  → Python list
+        branch:         Branch name (kept for identification/logging).
+        scope:          Which integrations to touch ("all" or list).
         base_dir:       Project root (defaults to current directory).
-        notify:         Callable invoked with a status string after each stage.
-                        Typically posts a message to Slack.
+        notify:         Callable invoked with a status string as the master
+                        agent streams its thoughts.
 
     Returns:
-        A dict with keys: analysis, transform, tests, prs, success, errors.
+        A dict with the final orchestrator summary.
     """
 
     def _notify(msg: str) -> None:
         logger.info(msg)
         if notify:
             try:
-                notify(msg)
+                # Add a prefix to distinguish master agent streams
+                notify(f"🤖 [Orchestrator] {msg.strip()}")
             except Exception as exc:
                 logger.warning("[pipeline] notify() raised: %s", exc)
 
-    targets = _parse_scope(scope)
+    from .integration_config import all_clients
+
+    # Normalize scope
+    if scope is None or scope == "all":
+        targets = all_clients()
+    elif isinstance(scope, list):
+        targets = [s.strip().lower() for s in scope if s.strip()]
+    else:
+        targets = [s.strip().lower() for s in str(scope).split(",") if s.strip()]
+
     results: dict = {
         "branch": branch,
         "scope": targets,
-        "analysis": None,
-        "transform": [],
-        "tests": {},
-        "prs": {},
         "success": False,
         "errors": [],
+        "summary": "",
     }
 
-    # ── Stage 1: Analyze ─────────────────────────────────────────────────────
-    _notify(f"🔍 *Stage 1/4 — Analysing diff* (branch: `{branch}`, scope: `{', '.join(targets)}`)")
+    if notify:
+        # Initial greeting without the prefix
+        try:
+            notify(f"🚀 *Triggered subagent pipeline* for `{', '.join(targets)}`")
+        except Exception:
+            pass
 
-    try:
-        analysis = analyze_diff(report_content)
-        results["analysis"] = analysis
-        n_changes = len(analysis.get("changes", []))
-        n_params = len(analysis.get("new_parameters", {}))
-        _notify(
-            f"✅ Analysis complete — {n_changes} change(s), {n_params} new parameter(s) detected."
-        )
-    except Exception as exc:
-        msg = f"❌ Stage 1 (analyze) failed: {exc}"
-        _notify(msg)
-        results["errors"].append(msg)
-        return results
-
-    # ── Stage 2: Transform ───────────────────────────────────────────────────
-    _notify(f"⚡ *Stage 2/4 — Updating integration code* ({len(targets)} client(s) in parallel) …")
-
-    try:
-        transform_results = transform_all(analysis, scope=targets, base_dir=base_dir)
-        results["transform"] = transform_results
-        ok = [r["client"] for r in transform_results if r.get("success")]
-        fail = [r["client"] for r in transform_results if not r.get("success")]
-        _notify(
-            f"✅ Transform complete — {len(ok)}/{len(targets)} succeeded."
-            + (f"  ⚠️ Failed: {', '.join(fail)}" if fail else "")
-        )
-        if fail:
-            for r in transform_results:
-                if not r.get("success"):
-                    results["errors"].append(f"transform[{r['client']}]: {r.get('error')}")
-    except Exception as exc:
-        msg = f"❌ Stage 2 (transform) failed: {exc}"
-        _notify(msg)
-        results["errors"].append(msg)
-        return results
-
-    # ── Stage 3: Test + Self-Heal ────────────────────────────────────────────
-    _notify("🧪 *Stage 3/4 — Running tests (auto-healing on failure)* …")
-
-    try:
-        test_results = run_and_heal_all(scope=targets, base_dir=base_dir, notify=_notify)
-        results["tests"] = test_results
-    except Exception as exc:
-        msg = f"❌ Stage 3 (test) failed: {exc}"
-        _notify(msg)
-        results["errors"].append(msg)
-        return results
-
-    # ── Test Results Report ───────────────────────────────────────────────
-    _notify(_build_test_report(test_results))
-
-    passing = [c for c, tr in test_results.items() if tr["passed"]]
-    failing = [c for c, tr in test_results.items() if not tr["passed"]]
-
-    if failing:
-        _notify(
-            f"⚠️ Tests failed for: {', '.join(failing)}. "
-            f"Creating PRs for passing clients only."
-        )
-        results["errors"].append(
-            f"Tests still failing for: {', '.join(failing)}"
-        )
-
-    if not passing:
-        _notify("❌ *Stage 4/4 — Skipped PR creation* (all tests failed)")
-        return results
-
-    _notify("🚀 *Stage 4/4 — Creating GitHub Pull Requests* …")
-
-    try:
-        pr_results = create_prs(
-            branch=branch,
-            analysis=analysis,
-            test_results=test_results,
-            scope=targets,
-            base_dir=base_dir,
-        )
-        results["prs"] = pr_results
-
-        for client, pr in pr_results.items():
-            if pr.get("url"):
-                _notify(f"  ✅ `{client}` PR → {pr['url']}")
-            elif pr.get("skipped"):
-                _notify(f"  ⏭️  `{client}` skipped — {pr.get('reason', '')}")
-            else:
-                _notify(f"  ❌ `{client}` PR failed — {pr.get('error', 'unknown error')}")
-    except Exception as exc:
-        msg = f"❌ Stage 4 (PRs) failed: {exc}"
-        _notify(msg)
-        results["errors"].append(msg)
-        return results
-
-    results["success"] = len(results["errors"]) == 0
-    _notify(
-        "🎉 *Pipeline complete!* "
-        + ("All stages succeeded." if results["success"] else f"{len(results['errors'])} error(s) encountered.")
+    prompt = _MASTER_PROMPT_TEMPLATE.format(
+        scope_csv=", ".join(targets),
+        report=report_content,
+        client_contexts=_build_client_contexts(targets),
     )
+
+    agents = {
+        "analyzer": _AGENT_ANALYZER,
+        "transformer": _AGENT_TRANSFORMER,
+        "healer": _AGENT_HEALER,
+    }
+
+    try:
+        final_summary = await run_orchestrator(
+            prompt=prompt,
+            agents=agents,
+            cwd=base_dir,
+            max_turns=100,  # Master agent needs many turns to coordinate all subagents
+            on_message=_notify,
+        )
+        results["summary"] = final_summary
+        results["success"] = True
+
+    except Exception as exc:
+        msg = f"❌ Pipeline orchestrator crashed: {exc}"
+        logger.exception("[pipeline] %s", msg)
+        if notify:
+            try:
+                notify(msg)
+            except Exception:
+                pass
+        results["errors"].append(msg)
+
     return results
