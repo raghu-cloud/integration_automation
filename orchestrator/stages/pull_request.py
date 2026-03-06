@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 
 from ..integration_config import get_repo_root, get_source_dir, get_all_source_files, get_all_test_files
-from ..utils.claude_cli import call_claude
+from ..utils.claude_cli import call_claude, MODEL_HAIKU
 from ..utils.git_utils import commit_and_push
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ def _draft_pr_content(client: str, analysis: dict, test_result: dict) -> dict:
 
     import json
 
-    raw = call_claude(prompt)
+    raw = call_claude(prompt, model=MODEL_HAIKU)
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -186,13 +186,17 @@ def create_prs(
             f"chore: propagate endee {version_to} API changes\n\n"
             f"Auto-committed by Integration Automation Orchestrator."
         )
-        pushed = commit_and_push(
+        push_status = commit_and_push(
             local_path=str(repo_root),
             branch_name=branch,
             commit_message=commit_msg,
             files=changed_files,
         )
-        if not pushed:
+        if push_status == "nothing":
+            logger.info("[pr][%s] Nothing to commit — skipping PR.", client)
+            results[client] = {"skipped": True, "reason": "No changes to commit", "url": None}
+            continue
+        if push_status == "error":
             results[client] = {"skipped": False, "url": None, "error": "git push failed"}
             continue
 

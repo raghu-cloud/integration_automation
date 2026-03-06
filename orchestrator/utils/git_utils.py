@@ -85,7 +85,7 @@ def commit_and_push(
     branch_name: str,
     commit_message: str,
     files: list[str] | None = None,
-) -> bool:
+) -> str:
     """
     Stage files (or all changes), commit, and push to origin.
 
@@ -96,7 +96,9 @@ def commit_and_push(
         files:          Specific files to stage. If None, stages all changes.
 
     Returns:
-        True on success, False on any failure.
+        "pushed"  – commit + push succeeded.
+        "nothing" – nothing to commit (no changes).
+        "error"   – a git command failed.
     """
     # Stage
     if files:
@@ -104,12 +106,12 @@ def commit_and_push(
             code, _, err = _run(["git", "add", f], cwd=local_path)
             if code != 0:
                 logger.error("[git] git add %s failed: %s", f, err)
-                return False
+                return "error"
     else:
         code, _, err = _run(["git", "add", "-A"], cwd=local_path)
         if code != 0:
             logger.error("[git] git add -A failed: %s", err)
-            return False
+            return "error"
 
     # Commit
     code, out, err = _run(
@@ -118,17 +120,17 @@ def commit_and_push(
     if code != 0:
         if "nothing to commit" in out or "nothing to commit" in err:
             logger.info("[git] Nothing to commit in %s — skipping push.", local_path)
-            return True
+            return "nothing"
         logger.error("[git] git commit failed: %s", err)
-        return False
+        return "error"
 
-    # Push
+    # Push — use gh as credential helper to ensure correct auth
     code, _, err = _run(
         ["git", "push", "origin", branch_name], cwd=local_path
     )
     if code != 0:
         logger.error("[git] git push failed: %s", err)
-        return False
+        return "error"
 
     logger.info("[git] Committed and pushed branch '%s'.", branch_name)
-    return True
+    return "pushed"

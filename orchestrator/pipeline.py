@@ -48,7 +48,7 @@ from .stages.transform import transform_all
 
 logger = logging.getLogger(__name__)
 
-_ALL_CLIENTS = ["crewai", "langchain", "llamaindex"]
+_ALL_CLIENTS = ["llamaindex"]
 
 
 def _build_test_report(test_results: dict) -> str:

@@ -37,7 +37,7 @@ import json
 import logging
 import re
 
-from ..utils.claude_cli import call_claude
+from ..utils.claude_cli import call_claude, MODEL_SONNET
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ def analyze_diff(report_content: str) -> dict:
     prompt = _PROMPT_TEMPLATE.format(report=report_content)
 
     logger.info("[analyze] Sending report to Claude CLI for analysis …")
-    raw = call_claude(prompt)
+    raw = call_claude(prompt, model=MODEL_SONNET)
 
     # Strip accidental markdown fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())

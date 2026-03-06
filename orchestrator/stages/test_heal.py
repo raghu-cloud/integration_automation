@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from ..integration_config import get_repo_root, get_source_dir, read_all_sources, read_all_test_files
-from ..utils.claude_cli import call_claude
+from ..utils.claude_cli import call_claude, MODEL_SONNET
 
 logger = logging.getLogger(__name__)
 
@@ -286,22 +286,59 @@ def _parse_test_counts(output: str) -> dict[str, int]:
     return counts
 
 
+def _is_env_error(test_output: str) -> bool:
+    """Return True if all failures are environment/import errors (not worth healing)."""
+    env_patterns = ["ModuleNotFoundError", "ImportError", "No module named"]
+    # Check if there are real assertion failures (worth healing)
+    has_assertion_fail = bool(
+        re.search(r"(AssertionError|assert |FAILED|failed)", test_output, re.IGNORECASE)
+    )
+    has_env_error = any(p in test_output for p in env_patterns)
+    # Skip heal only if we have env errors but NO assertion failures
+    return has_env_error and not has_assertion_fail
+
+
+def _extract_failing_test_files(test_output: str, test_sources: dict[str, str]) -> dict[str, str]:
+    """Filter test_sources to only include files that appear in the pytest failure output."""
+    if not test_sources:
+        return test_sources
+    failing = {}
+    for rel_path, content in test_sources.items():
+        # Check if this test file is mentioned in the pytest output
+        basename = Path(rel_path).name
+        if basename in test_output or rel_path in test_output:
+            failing[rel_path] = content
+    # If we couldn't match any, return all (safer fallback)
+    return failing if failing else test_sources
+
+
 def _heal(client: str, test_output: str, base_dir: str) -> None:
     """Ask Claude to fix source and/or test files and write fixes to disk."""
+    # Skip heal for environment/import errors — these need manual fixes
+    if _is_env_error(test_output):
+        logger.info(
+            "[test_heal][%s] Skipping heal — failures are environment/import errors.",
+            client,
+        )
+        return
+
     sources = read_all_sources(client)
     test_sources = read_all_test_files(client)
     repo_root = get_repo_root(client)
 
-    # Truncate test output to last 8K chars (failure info is at the end)
-    _MAX_TEST_OUTPUT = 8_000
+    # Truncate test output to last 4K chars (failure info is at the end)
+    _MAX_TEST_OUTPUT = 4_000
     if len(test_output) > _MAX_TEST_OUTPUT:
         test_output = (
-            "... [TRUNCATED — showing last 8000 chars] ...\n"
+            "... [TRUNCATED — showing last 4000 chars] ...\n"
             + test_output[-_MAX_TEST_OUTPUT:]
         )
 
+    # Only include test files that actually failed to reduce token usage
+    relevant_tests = _extract_failing_test_files(test_output, test_sources)
+
     all_files_block = _build_files_block(sources) if sources else "(no source files found)"
-    test_files_block = _build_files_block(test_sources) if test_sources else "(no test files found)"
+    test_files_block = _build_files_block(relevant_tests) if relevant_tests else "(no test files found)"
 
     # Cap total prompt size ~100K chars
     _MAX_PROMPT = 100_000
@@ -312,11 +349,11 @@ def _heal(client: str, test_output: str, base_dir: str) -> None:
             client, total,
         )
         # Trim test files block — keep only first 2 files
-        if len(test_sources) > 2:
-            trimmed = dict(list(test_sources.items())[:2])
+        if len(relevant_tests) > 2:
+            trimmed = dict(list(relevant_tests.items())[:2])
             test_files_block = (
                 _build_files_block(trimmed)
-                + f"\n... ({len(test_sources) - 2} more test file(s) omitted to fit context) ..."
+                + f"\n... ({len(relevant_tests) - 2} more test file(s) omitted to fit context) ..."
             )
         # Trim source block — keep only first 2 files
         if len(sources) > 2:
@@ -334,7 +371,7 @@ def _heal(client: str, test_output: str, base_dir: str) -> None:
     )
 
     logger.info("[test_heal][%s] Asking Claude to heal failing tests (prompt=%d chars) …", client, len(prompt))
-    raw = call_claude(prompt, timeout=180)
+    raw = call_claude(prompt, model=MODEL_SONNET, timeout=180)
 
     updated_files = _parse_multi_file_response(raw)
 

@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 from ..integration_config import get_repo_root, get_source_dir, read_all_sources, read_all_test_files
-from ..utils.claude_cli import call_claude
+from ..utils.claude_cli import call_claude, MODEL_OPUS
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +128,18 @@ def _format_new_params(new_parameters: dict) -> str:
 
 
 def _build_files_block(sources: dict[str, str]) -> str:
-    """Concatenate all source files into a single labelled block."""
+    """Concatenate all source files into a single labelled block.
+
+    Skips __init__.py and __pycache__ files to reduce token usage.
+    """
     parts = []
     for rel_path, content in sorted(sources.items()):
+        # Skip files that add tokens but no useful signal
+        basename = Path(rel_path).name
+        if basename == "__init__.py" and content.strip() == "":
+            continue
+        if "__pycache__" in rel_path:
+            continue
         parts.append(_FILE_BLOCK.format(rel_path=rel_path, content=content))
     return "\n".join(parts)
 
@@ -355,7 +364,7 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
     )
 
     logger.info("[transform][%s] Calling Claude CLI …", client)
-    raw = call_claude(prompt)
+    raw = call_claude(prompt, model=MODEL_OPUS)
 
     # Parse per-file output
     updated_files = _parse_multi_file_response(raw)
@@ -436,7 +445,7 @@ def _transform_one(client: str, analysis: dict, base_dir: str) -> dict:
 
         logger.info("[transform][%s] Calling Claude CLI to update tests (prompt=%d chars) …", client, len(test_prompt))
         try:
-            raw_tests = call_claude(test_prompt, timeout=180)
+            raw_tests = call_claude(test_prompt, model=MODEL_OPUS, timeout=180)
             updated_test_files = _parse_multi_file_response(raw_tests)
 
             if not updated_test_files and len(test_sources) == 1:

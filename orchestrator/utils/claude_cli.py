@@ -30,6 +30,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# ── Model constants ─────────────────────────────────────────────────────────
+# Use these in call_claude(model=...) to select per-stage models.
+MODEL_OPUS = "opus"
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-3-5-20241022"
+
 # Maximum characters to pass as a CLI argument directly.
 # Prompts longer than this threshold are written to a temp file and read via
 # stdin to avoid OS argument-length limits (macOS: ~2 MB, Linux: ~128 KB).
@@ -38,6 +44,8 @@ _ARG_LIMIT = 60_000
 
 def call_claude(
     prompt: str,
+    *,
+    model: str | None = None,
     cwd: str | None = None,
     timeout: int = 300,
     extra_flags: list[str] | None = None,
@@ -47,6 +55,8 @@ def call_claude(
 
     Args:
         prompt:       The full prompt to send to Claude.
+        model:        Model name or alias to pass via --model (e.g. "opus",
+                      "claude-sonnet-4-6"). None = CLI default.
         cwd:          Working directory for the subprocess (default: current dir).
         timeout:      Seconds before the subprocess is killed (default: 300).
         extra_flags:  Additional CLI flags, e.g. ["--allowedTools", "Bash"].
@@ -67,6 +77,11 @@ def call_claude(
         )
 
     base_flags = extra_flags or []
+
+    # Inject --model flag when a specific model is requested
+    if model:
+        base_flags = ["--model", model] + base_flags
+
     tmp_path = None
 
     if len(prompt) <= _ARG_LIMIT:
@@ -88,7 +103,8 @@ def call_claude(
         stdin_data = Path(tmp_path).read_text(encoding="utf-8")
 
     logger.info(
-        "[claude_cli] Calling claude -p (prompt_len=%d, cwd=%s)", len(prompt), cwd or "."
+        "[claude_cli] Calling claude -p (model=%s, prompt_len=%d, cwd=%s)",
+        model or "default", len(prompt), cwd or ".",
     )
 
     try:
