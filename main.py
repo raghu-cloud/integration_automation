@@ -97,24 +97,30 @@ def get_python_files(folder: Path) -> dict:
 
 
 def compare_code_diff(files_v1: dict, files_v2: dict) -> str:
-    lines = ["=" * 50, "📄 LINE BY LINE CODE DIFF", "=" * 50]
+    lines = ["*LINE-BY-LINE CODE DIFFERENCES*"]
     for filename in sorted(set(files_v1) | set(files_v2)):
+        if filename in ("setup.py", "__init__.py") or filename.endswith("__init__.py"):
+            continue
         v1 = files_v1.get(filename, "").splitlines()
         v2 = files_v2.get(filename, "").splitlines()
         if v1 == v2:
             continue
-        file_lines = [f"\n📄 {filename}"]
+            
+        file_lines = [f"\nFile: {filename}", "```diff"]
         for group in difflib.SequenceMatcher(None, v1, v2).get_grouped_opcodes(3):
             for tag, i1, i2, j1, j2 in group:
                 if tag == "equal":
                     for line in v1[i1:i2]:
-                        file_lines.append(f"     {line}")
+                        if line.strip(): # Skip empty context lines
+                            file_lines.append(f"  {line}")
                 elif tag in ("replace", "delete"):
                     for line in v1[i1:i2]:
-                        file_lines.append(f"➖  {line}")
+                        file_lines.append(f"- {line}")
                 if tag in ("replace", "insert"):
                     for line in v2[j1:j2]:
-                        file_lines.append(f"➕  {line}")
+                        file_lines.append(f"+ {line}")
+        
+        file_lines.append("```\n") # Close code block
         lines.extend(file_lines)
     if len(lines) == 3:
         lines.append("No code differences found.")
@@ -137,8 +143,8 @@ def extract_functions(source: str) -> dict:
 def compare_function_signatures(files_v1: dict, files_v2: dict, v1: str = "", v2: str = "") -> str:
     v1_label = f"v{v1}" if v1 else "v1"
     v2_label = f"v{v2}" if v2 else "v2"
-    lines = ["\n" + "=" * 50, "🔍 CHANGED FUNCTION SIGNATURES", "=" * 50]
-    lines.append(f"(NEW = added in {v2_label} | REMOVED = absent in {v2_label} compared to {v1_label})")
+    lines = ["\n*FUNCTION SIGNATURE CHANGES*"]
+    lines.append(f"_(NEW = added in {v2_label} | REMOVED = absent in {v2_label} compared to {v1_label})_")
     for filename in sorted(set(files_v1) | set(files_v2)):
         f1 = extract_functions(files_v1.get(filename, ""))
         f2 = extract_functions(files_v2.get(filename, ""))
@@ -146,13 +152,13 @@ def compare_function_signatures(files_v1: dict, files_v2: dict, v1: str = "", v2
         removed = set(f1) - set(f2)   # in v1 but not v2
         changed = {f for f in set(f1) & set(f2) if f1[f] != f2[f]}
         if new or removed or changed:
-            lines.append(f"\n📁 {filename}")
+            lines.append(f"\nFile: {filename}")
             for f in sorted(new):
-                lines.append(f"  ✅ NEW ({v2_label}):     {f2[f]}")
+                lines.append(f"  [NEW] ({v2_label}):     {f2[f]}")
             for f in sorted(removed):
-                lines.append(f"  ❌ REMOVED ({v2_label}): {f1[f]}")
+                lines.append(f"  [REMOVED] ({v2_label}): {f1[f]}")
             for f in sorted(changed):
-                lines.append(f"  ✏️  CHANGED:\n      {v1_label}: {f1[f]}\n      {v2_label}: {f2[f]}")
+                lines.append(f"  [MODIFIED]:\n      {v1_label}: {f1[f]}\n      {v2_label}: {f2[f]}")
     if len(lines) == 4:
         lines.append("No function signature changes found.")
     return "\n".join(lines)
@@ -167,16 +173,16 @@ def get_requirements(folder: Path) -> set:
 def compare_dependencies(folder_v1: Path, folder_v2: Path, v1: str = "", v2: str = "") -> str:
     v1_label = f"v{v1}" if v1 else "v1"
     v2_label = f"v{v2}" if v2 else "v2"
-    lines   = ["\n" + "=" * 50, "📦 DEPENDENCIES COMPARISON", "=" * 50]
-    lines.append(f"(Added = new in {v2_label} | Removed = absent in {v2_label} compared to {v1_label})")
+    lines   = ["\n*DEPENDENCIES COMPARISON*"]
+    lines.append(f"_(Added = new in {v2_label} | Removed = absent in {v2_label} compared to {v1_label})_")
     r1, r2  = get_requirements(folder_v1), get_requirements(folder_v2)
     added   = r2 - r1   # in v2 but not v1
     removed = r1 - r2   # in v1 but not v2
     if added:
-        lines.append(f"\n✅ Added in {v2_label}:")
+        lines.append(f"\nAdded in {v2_label}:")
         lines.extend(f"   + {r}" for r in sorted(added))
     if removed:
-        lines.append(f"\n❌ Removed in {v2_label}:")
+        lines.append(f"\nRemoved in {v2_label}:")
         lines.extend(f"   - {r}" for r in sorted(removed))
     if not added and not removed:
         lines.append("No dependency changes found.")
@@ -187,13 +193,14 @@ def run_comparison(channel: str, v1: str = VERSION_1, v2: str = VERSION_2):
     """Main agent — triggered when user types 'run [v1] [v2]' in Slack."""
     try:
         # Notify Slack that the task has started
-        slack_client.chat_postMessage(
+        resp = slack_client.chat_postMessage(
             channel=channel,
-            text=f"🤖 Agent started! Comparing *{PACKAGE_NAME}* v{v1} vs v{v2}... Please wait ⏳"
+            text=f"Agent process initiated. Comparing *{PACKAGE_NAME}* v{v1} vs v{v2}. Please wait."
         )
+        init_ts = resp.get("ts")
 
         # Step 1: Download both versions
-        slack_client.chat_postMessage(channel=channel, text="⬇️ Downloading both versions from PyPI...")
+        slack_client.chat_postMessage(channel=channel, thread_ts=init_ts, text="Downloading specified versions from PyPI...")
         folder_v1 = download_package(PACKAGE_NAME, v1)
         folder_v2 = download_package(PACKAGE_NAME, v2)
 
@@ -202,7 +209,7 @@ def run_comparison(channel: str, v1: str = VERSION_1, v2: str = VERSION_2):
         files_v2 = get_python_files(folder_v2)
 
         # Step 3: Run comparisons
-        slack_client.chat_postMessage(channel=channel, text="🔍 Comparing changes...")
+        slack_client.chat_postMessage(channel=channel, thread_ts=init_ts, text="Analyzing codebase differences...")
         header      = f"\nPACKAGE : {PACKAGE_NAME}\nv1      : {v1}\nv2      : {v2}\n"
         diff_report = compare_code_diff(files_v1, files_v2)
         func_report = compare_function_signatures(files_v1, files_v2, v1, v2)
@@ -216,25 +223,30 @@ def run_comparison(channel: str, v1: str = VERSION_1, v2: str = VERSION_2):
         # Step 5: Send full report to Slack as plain text (chunked to stay within 4000-char limit)
         slack_client.chat_postMessage(
             channel=channel,
+            thread_ts=init_ts,
             text=(
-                f"✅ *Comparison Complete!*\n"
-                f"📦 Package: `{PACKAGE_NAME}`\n"
-                f"🔁 Versions: `{v1}` → `{v2}`\n"
-                f"📄 Full report saved to: `{REPORT_FILE}`"
+                f"*Comparison Completed*\n"
+                f"Package: `{PACKAGE_NAME}`\n"
+                f"Versions: `{v1}` -> `{v2}`\n"
+                f"Full report saved to: `{REPORT_FILE}`"
             )
         )
 
         def send_in_chunks(text: str):
             chunk_size = 3900
             for i in range(0, len(text), chunk_size):
-                slack_client.chat_postMessage(channel=channel, text=text[i:i + chunk_size])
+                slack_client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=init_ts,
+                    text=text[i:i + chunk_size]
+                )
 
         send_in_chunks(func_report)
         send_in_chunks(deps_report)
         send_in_chunks(diff_report)
 
     except Exception as e:
-        slack_client.chat_postMessage(channel=channel, text=f"❌ Error: {str(e)}")
+        slack_client.chat_postMessage(channel=channel, thread_ts=init_ts, text=f"Error encountered: {str(e)}")
 
 
 # ─────────────────────────────────────────
@@ -363,7 +375,7 @@ async def slash_sync_clients(request: Request, background_tasks: BackgroundTasks
     return {
         "response_type": "ephemeral",
         "text": (
-            f"⚙️ Starting `sync-clients` pipeline…\n"
+            f"Initializing `sync-clients` pipeline.\n"
             f"Branch: `{branch}` | Scope: `{scope}`\n"
             "Progress updates will appear in this channel."
         ),
@@ -393,7 +405,7 @@ def _run_pipeline_background(
         slack_client.chat_postMessage(
             channel=channel,
             text=(
-                "❌ Pipeline orchestrator is not available.\n"
+                "Error: Pipeline orchestrator is not available.\n"
                 "Ensure the `claude` CLI is installed (`npm install -g @anthropic-ai/claude-code`) "
                 "and `pip install -r requirements.txt` has been run."
             ),
@@ -405,7 +417,7 @@ def _run_pipeline_background(
         slack_client.chat_postMessage(
             channel=channel,
             text=(
-                f"❌ Comparison report not found at `{report_path}`.\n"
+                f"Error: Comparison report not found at `{report_path}`.\n"
                 "Run a comparison first (`run <v1> <v2>`), then re-trigger automation."
             ),
         )
@@ -417,7 +429,7 @@ def _run_pipeline_background(
     resp = slack_client.chat_postMessage(
         channel=channel,
         text=(
-            f"🤖 <@{trigger_user}> triggered *sync-clients* "
+            f"<@{trigger_user}> initiated *sync-clients* process "
             f"(branch: `{branch}`, scope: `{scope}`)"
         ),
     )
@@ -446,14 +458,38 @@ def _run_pipeline_background(
         # Final summary
         errors = results.get("errors", [])
         success = results.get("success", False)
+        cost = results.get("cost", 0.0)
+        usage = results.get("usage", {})
 
         summary_lines = ["─" * 40]
-        summary_lines.append(
-            "✅ *Pipeline finished successfully!*" if success
-            else "⚠️ *Pipeline finished with errors.*"
-        )
+        if success:
+            summary_lines.append("*Pipeline execution completed successfully.*")
+        else:
+            summary_lines.append("*Pipeline execution completed with errors.*")
+            
+        # Append cost and usage if available
+        if cost > 0:
+            master = usage.get("master_usage", {})
+            subagent = usage.get("subagent_usage", {})
+
+            m_in = master.get("input_tokens", 0) + master.get("cache_read_input_tokens", 0) + master.get("cache_creation_input_tokens", 0)
+            m_out = master.get("output_tokens", 0)
+            # Calculate total subagent tokens across all tracked subagents
+            s_total = sum(d.get("total_tokens", 0) for d in subagent.values())
+            total_tokens = m_in + m_out + s_total
+
+            summary_lines.append(f"*Cost / Usage Summary:*")
+            summary_lines.append(f"  • Total Cost: `${cost:.4f}` ({total_tokens:,} total tokens)")
+            summary_lines.append(f"  • Master (Haiku): Input: {m_in:,} | Output: {m_out:,}")
+            if s_total > 0:
+                summary_lines.append(f"  • Subagents (Sonnet): ~{s_total:,} total tokens")
+                for sub_name, sub_data in sorted(subagent.items()):
+                    st = sub_data.get("total_tokens", 0)
+                    if st > 0:
+                        summary_lines.append(f"      ◦ _{sub_name}_: {st:,} tokens")
+
         if errors:
-            summary_lines.append("*Errors:*")
+            summary_lines.append("\n*Errors Encountered:*")
             summary_lines.extend(f"  • {e}" for e in errors[:5])
 
         slack_client.chat_postMessage(
@@ -472,5 +508,5 @@ def _run_pipeline_background(
         slack_client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=f"❌ Pipeline encountered an unexpected error: `{exc}`",
+            text=f"Pipeline encountered an unexpected error: `{exc}`",
         )

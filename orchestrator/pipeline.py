@@ -34,18 +34,16 @@ logger = logging.getLogger(__name__)
 # ── Subagent Definitions ───────────────────────────────────────────────────
 
 _COMMON_FRAMEWORK_PROMPT = """\
-You are an expert Python engineer responsible for maintaining this framework's endee integration.
-Given an assigned task summarizing upstream changes (new parameters, types, defaults, etc.):
+Role: Expert Python engineer maintaining this framework's endee integration.
+Task: Auto-update the integration for new upstream API changes.
 
-1. Navigate to the provided repository path.
-2. Read the source files in the specific source dir to understand the current API.
-3. Update the source files to support the new endee parameters:
-   - Make sure they are correctly added to the public API and forwarded to index.query().
-   - Maintain full backward compatibility (use provided defaults).
-   - Abide by the framework's specific API patterns.
-4. Update the test files in tests/ and run `pytest` via Bash.
-5. If tests fail, fix the files and rerun `pytest` until they all pass.
-6. Return a concise summary of the files changed and the final test results.
+STRICT INSTRUCTIONS:
+1. Navigate to the provided Repo Path. Review files in the Source Dir.
+2. Update the source files. Add the new endee parameters to the public vector store API and forward them directly to `index.query()`.
+3. Preserve full backward compatibility. Use defaults. Do not break existing API calls.
+4. Strictly abide by the framework's native API patterns.
+5. Update tests in tests/. Run `pytest` via Bash. Automatically fix files if tests fail until they all pass.
+6. OUTPUT ONLY a concise summary of the files modified and final test pass/fail status. No conversational filler.
 """
 
 _AGENT_CREWAI = AgentDefinition(
@@ -61,7 +59,7 @@ _AGENT_CREWAI = AgentDefinition(
         "`index.query()` inside the `_run()` method."
     ),
     tools=["Read", "Edit", "Glob", "Grep", "Bash"],
-    model=MODEL_OPUS,
+    model=MODEL_SONNET,
 )
 
 _AGENT_LANGCHAIN = AgentDefinition(
@@ -76,7 +74,7 @@ _AGENT_LANGCHAIN = AgentDefinition(
         "New params should be explicit keyword args with defaults so existing callers are unaffected."
     ),
     tools=["Read", "Edit", "Glob", "Grep", "Bash"],
-    model=MODEL_OPUS,
+    model=MODEL_SONNET,
 )
 
 _AGENT_LLAMAINDEX = AgentDefinition(
@@ -92,42 +90,32 @@ _AGENT_LLAMAINDEX = AgentDefinition(
         "without changing the base API."
     ),
     tools=["Read", "Edit", "Glob", "Grep", "Bash"],
-    model=MODEL_OPUS,
+    model=MODEL_SONNET,
 )
 
 # ── Master Orchestrator Prompt ─────────────────────────────────────────────
 
 _MASTER_PROMPT_TEMPLATE = """\
-You are the Master Orchestrator for the Integration Update Pipeline.
-Your goal is to update the downstream endee integrations ({scope_csv})
-based on a new upstream Python SDK release.
+Role: Master Orchestrator for Integration Update Pipeline.
+Goal: Update downstream endee integrations ({scope_csv}) for a new upstream Python SDK release.
 
-─── COMPARISON REPORT (UPSTREAM CHANGES) ─────────────────────────────────
+UPSTREAM CHANGES REPORT:
 {report}
-─────────────────────────────────────────────────────────────────────────
 
-You have dedicated subagents available via the Task tool for each framework:
+Available Task tools (subagents):
 - `crewai_agent`
 - `langchain_agent`
 - `llamaindex_agent`
 
-INSTRUCTIONS:
-Step 1: Read the comparison report above and deduce what the new parameters, types, 
-        and defaults are. Prepare a concise summary of these changes.
-
-Step 2: For EACH integration in scope ({scope_csv}), note its Repo Path and Source Dir:
+STRICT INSTRUCTIONS:
+1. Extract new parameters, types, and defaults from the report concisely.
+2. For EACH integration in scope ({scope_csv}), note its context:
 {client_contexts}
-
-Step 3: For each integration, use the `Task` tool to call the corresponding 
-        subagent (e.g., call `langchain_agent` for the `langchain` integration):
-        - Pass it the summary of upstream changes.
-        - Give it the exact Repo Path and Source Dir so it knows where to work.
-        - Let it autonomously modify the code and run the tests.
-        (Do them one by one).
-
-Step 4: Wait for the subagent to report the final pass/fail test status.
-
-Step 5: Provide a final summary indicating which frameworks succeeded and their test results.
+3. Sequentially use the `Task` tool to call the corresponding subagent (e.g., `langchain_agent`). Pass it:
+   - The concise API changes summary.
+   - The exact Repo Path and Source Dir.
+4. Wait for the subagent's test results before proceeding to the next.
+5. End your response with ONLY a final, concise status report (pass/fail per integration). NO conversational filler and NO hallucinated steps.
 """
 
 
@@ -173,7 +161,7 @@ async def run_pipeline(
         if notify:
             try:
                 # Add a prefix to distinguish master agent streams
-                notify(f"🤖 [Orchestrator] {msg.strip()}")
+                notify(f"[Orchestrator] {msg.strip()}")
             except Exception as exc:
                 logger.warning("[pipeline] notify() raised: %s", exc)
 
@@ -193,12 +181,14 @@ async def run_pipeline(
         "success": False,
         "errors": [],
         "summary": "",
+        "cost": 0.0,
+        "usage": {},
     }
 
     if notify:
         # Initial greeting without the prefix
         try:
-            notify(f"🚀 *Triggered framework-specific subagent pipeline* for `{', '.join(targets)}`")
+            notify(f"*Triggered framework-specific subagent pipeline* for `{', '.join(targets)}`")
         except Exception:
             pass
 
@@ -218,7 +208,7 @@ async def run_pipeline(
     active_agents = {k: v for k, v in agents.items() if k.replace("_agent", "") in targets}
 
     try:
-        final_summary = await run_orchestrator(
+        final_summary, cost, usage = await run_orchestrator(
             prompt=prompt,
             agents=active_agents,
             cwd=base_dir,
@@ -226,10 +216,12 @@ async def run_pipeline(
             on_message=_notify,
         )
         results["summary"] = final_summary
+        results["cost"] = cost
+        results["usage"] = usage
         results["success"] = True
 
     except Exception as exc:
-        msg = f"❌ Pipeline orchestrator crashed: {exc}"
+        msg = f"Error: Pipeline orchestrator crashed: {exc}"
         logger.exception("[pipeline] %s", msg)
         if notify:
             try:

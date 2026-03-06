@@ -1,146 +1,54 @@
 
 PACKAGE : endee
 v1      : 0.1.15
-v2      : 0.1.17
-==================================================
-📄 LINE BY LINE CODE DIFF
-==================================================
+v2      : 0.1.16
+*LINE-BY-LINE CODE DIFFERENCES*
 
-📄 endee/constants.py
-     COUNT_FIELD = "count"
-     PRECISION_FIELD = "precision"
-     MAX_CONNECTIONS_FIELD = "M"
-➕  EF_CONSTRUCTION_FIELD = "ef_con"
-     
-     
-     # Requests Library Session Configuration
+File: endee/constants.py
+```diff
+  COUNT_FIELD = "count"
+  PRECISION_FIELD = "precision"
+  MAX_CONNECTIONS_FIELD = "M"
++ EF_CONSTRUCTION_FIELD = "ef_con"
+  # Requests Library Session Configuration
+```
 
-📄 endee/index.py
-         DEFAULT_PREFILTER_CARDINALITY_THRESHOLD,
-         DEFAULT_TOPK,
-         DIMENSION_FIELD,
-➕      EF_CONSTRUCTION_FIELD,
-         IS_HYBRID_FIELD,
-         MAX_CONNECTIONS_FIELD,
-         MAX_VECTORS_PER_BATCH,
-         SPARSE_DIM_FIELD,
-     )
-     from .exceptions import raise_exception
-➖  from .schema import IndexMetadata, QueryRequest, VectorItem
-➕  from .schema import FilterUpdateRequest, IndexMetadata, QueryRequest, VectorItem
-     
-     
-     class Index:
-             self.dimension = metadata.dimension
-             self.precision = metadata.precision
-             self.M = metadata.M
-➕          self.ef_con = metadata.ef_con
-             self.sparse_dim = metadata.sparse_dim
-     
-             # Use shared HTTP manager from Endee client
-             result = {
-                 "id": vector_obj[0],
-                 "meta": json_unzip(vector_obj[1]),
-➖              "filter": vector_obj[2],
-➕              "filter": orjson.loads(vector_obj[2]),
-                 "norm": vector_obj[3],
-                 "vector": list(vector_obj[4]),
-             }
-                 result["sparse_values"] = list(vector_obj[6]) if vector_obj[6] else []
-     
-             return result
-➕  
-➕      def update_filters(self, updates):
-➕          """
-➕          Update filters for multiple vectors by ID.
-➕  
-➕          Updates the filter metadata for specified vectors without modifying
-➕          the vector data itself or other metadata fields.
-➕  
-➕          Args:
-➕              updates: List of dictionaries, each containing:
-➕                  - id (str): Vector identifier
-➕                  - filter (dict): New filter metadata to set
-➕  
-➕          Returns:
-➕              str: Success message with number of filters updated
-➕  
-➕          Raises:
-➕              ValueError: If updates parameter is invalid
-➕              HTTPError: If update fails
-➕  
-➕          Example:
-➕              >>> index.update_filters([
-➕              ...     {"id": "vec1", "filter": {"category": "B"}},
-➕              ...     {"id": "vec2", "filter": {"category": "C", "priority": 1}}
-➕              ... ])
-➕              '2 filters updated'
-➕          """
-➕          # Validate using Pydantic
-➕          update_req = FilterUpdateRequest(updates=updates)
-➕          validated_updates = [item.model_dump() for item in update_req.updates]
-➕  
-➕          headers = {"Authorization": f"{self.token}", "Content-Type": "application/json"}
-➕  
-➕          data = {"updates": validated_updates}
-➕  
-➕          url = f"{self.url}/index/{self.name}/filters/update"
-➕  
-➕          http_client = self._get_session_client()
-➕          response = http_client.post(url, headers=headers, json=data)
-➕  
-➕          if response.status_code != 200:
-➕              raise_exception(response.status_code, response.text)
-➕  
-➕          return response.text
-     
-         def describe(self):
-             """
-                 COUNT_FIELD: self.count,
-                 PRECISION_FIELD: self.precision,
-                 MAX_CONNECTIONS_FIELD: self.M,
-➕              EF_CONSTRUCTION_FIELD: self.ef_con,
-             }
-             return data
 
-📄 endee/schema.py
-         dimension: int = Field(..., alias="dimension")
-         precision: Optional[str] = Field(None, alias="precision")
-         M: int = Field(..., alias="M")
-➕      ef_con: int = Field(..., alias="ef_con")
-         sparse_dim: int = Field(0, alias="sparse_dim")
-➕  
-➕  
-➕  class FilterUpdateItem(BaseModel):
-➕      """Model for a single filter update item."""
-➕  
-➕      id: str = Field(..., min_length=1)
-➕      filter: Dict[str, Any]
-➕  
-➕  
-➕  class FilterUpdateRequest(BaseModel):
-➕      """Model for multiple filter update requests."""
-➕  
-➕      updates: List[FilterUpdateItem]
+File: endee/index.py
+```diff
+      DEFAULT_PREFILTER_CARDINALITY_THRESHOLD,
+      DEFAULT_TOPK,
+      DIMENSION_FIELD,
++     EF_CONSTRUCTION_FIELD,
+      IS_HYBRID_FIELD,
+      MAX_CONNECTIONS_FIELD,
+      MAX_VECTORS_PER_BATCH,
+          self.dimension = metadata.dimension
+          self.precision = metadata.precision
+          self.M = metadata.M
++         self.ef_con = metadata.ef_con
+          self.sparse_dim = metadata.sparse_dim
+          # Use shared HTTP manager from Endee client
+              COUNT_FIELD: self.count,
+              PRECISION_FIELD: self.precision,
+              MAX_CONNECTIONS_FIELD: self.M,
++             EF_CONSTRUCTION_FIELD: self.ef_con,
+          }
+          return data
+```
 
-📄 setup.py
-     setup(
-         # Package Metadata
-         name="endee",
-➖      version="0.1.15",
-➕      version="0.1.17",
-         author="Endee Labs",
-         author_email="dev@endee.io",
-         description=(
-==================================================
-🔍 CHANGED FUNCTION SIGNATURES
-==================================================
-(NEW = added in v0.1.17 | REMOVED = absent in v0.1.17 compared to v0.1.15)
 
-📁 endee/index.py
-  ✅ NEW (v0.1.17):     def update_filters(self, updates)
-==================================================
-📦 DEPENDENCIES COMPARISON
-==================================================
-(Added = new in v0.1.17 | Removed = absent in v0.1.17 compared to v0.1.15)
+File: endee/schema.py
+```diff
+      dimension: int = Field(..., alias="dimension")
+      precision: Optional[str] = Field(None, alias="precision")
+      M: int = Field(..., alias="M")
++     ef_con: int = Field(..., alias="ef_con")
+      sparse_dim: int = Field(0, alias="sparse_dim")
+```
+
+*FUNCTION SIGNATURE CHANGES*
+_(NEW = added in v0.1.16 | REMOVED = absent in v0.1.16 compared to v0.1.15)_
+*DEPENDENCIES COMPARISON*
+_(Added = new in v0.1.16 | Removed = absent in v0.1.16 compared to v0.1.15)_
 No dependency changes found.

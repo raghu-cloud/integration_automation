@@ -28,6 +28,8 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
     query,
 )
 
@@ -46,7 +48,7 @@ async def run_orchestrator(
     cwd: str | None = None,
     max_turns: int | None = None,
     on_message: callable | None = None,
-) -> str:
+) -> tuple[str, float, dict]:
     """
     Run a master orchestrator agent that delegates to subagents via Task tool.
 
@@ -58,7 +60,7 @@ async def run_orchestrator(
         on_message: Optional callback for streaming assistant text updates.
 
     Returns:
-        The orchestrator's final result text.
+        A tuple of (result_text, total_cost_usd, usage_dict).
     """
     options = ClaudeAgentOptions(
         agents=agents,
@@ -66,7 +68,7 @@ async def run_orchestrator(
         permission_mode="bypassPermissions",
         max_turns=max_turns or 60,
         cwd=cwd,
-        model=MODEL_SONNET,
+        model=MODEL_HAIKU,
     )
 
     logger.info(
@@ -77,8 +79,24 @@ async def run_orchestrator(
     )
 
     result_text = ""
+    total_cost_usd = 0.0
+    usage_dict = {"master_usage": {}, "subagent_usage": {}}
+    
+    # Map task_id -> agent_name (from task_type)
+    task_agent_map = {}
 
     async for message in query(prompt=prompt, options=options):
+        if isinstance(message, TaskStartedMessage):
+            if message.task_type:
+                task_agent_map[message.task_id] = message.task_type
+
+        if isinstance(message, TaskNotificationMessage):
+            agent_name = task_agent_map.get(message.task_id, "unknown_agent")
+            if agent_name not in usage_dict["subagent_usage"]:
+                usage_dict["subagent_usage"][agent_name] = {"total_tokens": 0}
+            if message.usage:
+                usage_dict["subagent_usage"][agent_name]["total_tokens"] += message.usage.get("total_tokens", 0)
+
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if hasattr(block, "text") and block.text:
@@ -94,6 +112,10 @@ async def run_orchestrator(
         if isinstance(message, ResultMessage):
             if message.result:
                 result_text = message.result
+            if message.total_cost_usd is not None:
+                total_cost_usd = message.total_cost_usd
+            if message.usage:
+                usage_dict["master_usage"] = message.usage
             if message.is_error:
                 logger.error("[orchestrator] Finished with error.")
             logger.info(
@@ -102,4 +124,4 @@ async def run_orchestrator(
                 message.total_cost_usd,
             )
 
-    return result_text
+    return result_text, total_cost_usd, usage_dict
