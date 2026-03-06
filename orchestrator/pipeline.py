@@ -3,18 +3,19 @@ pipeline.py — Integration Automation Pipeline
 =============================================
 
 Master orchestrator using true Claude Code subagent architecture.
-Instead of standalone Python stages, we define `AgentDefinition` subagents
-and hand them to a single master agent via the `run_orchestrator` wrapper.
+Instead of standalone Python stages, we define framework-specific `AgentDefinition` 
+subagents and hand them to a single master agent via the `run_orchestrator` wrapper.
 
 Master Agent:
-  - Guided by the main prompt
-  - Delegates to named subagents (analyzer, transformer, healer)
+  - Guided by the main prompt to process a new SDK release
+  - Analyzes the diff report
+  - Delegates the complete update/testing flow to the appropriate framework subagent
   - Uses the `Task` tool for delegation
 
 Subagents:
-  - analyzer:    Parses diffs into structured summaries
-  - transformer: Rewrites integration source code using Read/Edit tools
-  - healer:      Runs pytest and uses Read/Edit/Bash to fix failing tests
+  - crewai_agent:      Updates CrewAI integrations & fixes their tests
+  - langchain_agent:   Updates LangChain integrations & fixes their tests
+  - llamaindex_agent:  Updates LlamaIndex integrations & fixes their tests
 """
 
 from __future__ import annotations
@@ -32,52 +33,66 @@ logger = logging.getLogger(__name__)
 
 # ── Subagent Definitions ───────────────────────────────────────────────────
 
-_AGENT_ANALYZER = AgentDefinition(
-    description=(
-        "Analyzes upstream SDK diffs (comparison reports) and identifies "
-        "meaningful API changes, extracting new parameters, types, and defaults."
-    ),
-    prompt=(
-        "You are a senior Python SDK analyst. Your job is to extract every "
-        "meaningful change from the provided comparison report and return a "
-        "concise summary of WHAT changed, WHICH parameters were added, "
-        "and their default values/types. Do not write code."
-    ),
-    model=MODEL_SONNET,
-)
+_COMMON_FRAMEWORK_PROMPT = """\
+You are an expert Python engineer responsible for maintaining this framework's endee integration.
+Given an assigned task summarizing upstream changes (new parameters, types, defaults, etc.):
 
-_AGENT_TRANSFORMER = AgentDefinition(
+1. Navigate to the provided repository path.
+2. Read the source files in the specific source dir to understand the current API.
+3. Update the source files to support the new endee parameters:
+   - Make sure they are correctly added to the public API and forwarded to index.query().
+   - Maintain full backward compatibility (use provided defaults).
+   - Abide by the framework's specific API patterns.
+4. Update the test files in tests/ and run `pytest` via Bash.
+5. If tests fail, fix the files and rerun `pytest` until they all pass.
+6. Return a concise summary of the files changed and the final test results.
+"""
+
+_AGENT_CREWAI = AgentDefinition(
     description=(
-        "An expert Python engineer that updates integration source code "
-        "folders to support new upstream parameters and API changes."
+        "An expert Python engineer that updates CrewAI integrations. "
+        "It can read/edit files and run tests autonomously."
     ),
     prompt=(
-        "You are an expert Python engineer updating downstream SDK integrations. "
-        "Given an analysis of upstream changes: "
-        "1. CD into the provided integration repository. "
-        "2. Add new parameters to index.query() calls and public methods. "
-        "3. Preserve existing defaults to remain backward compatible. "
-        "4. Fix tests if there are test files. "
-        "Use Read/Edit tools to explore and modify the codebase directly."
+        _COMMON_FRAMEWORK_PROMPT + 
+        "\nIMPORTANT FRAMEWORK CONTEXT:\n"
+        "CrewAI tools inherit from `BaseTool`. The new params must appear in the "
+        "Pydantic input schema (e.g. `EndeeSearchInput`) AND be forwarded to "
+        "`index.query()` inside the `_run()` method."
     ),
     tools=["Read", "Edit", "Glob", "Grep", "Bash"],
     model=MODEL_OPUS,
 )
 
-_AGENT_HEALER = AgentDefinition(
+_AGENT_LANGCHAIN = AgentDefinition(
     description=(
-        "An expert Python test engineer that runs pytest and fixes failing "
-        "tests iteratively using Bash, Read, and Edit tools."
+        "An expert Python engineer that updates LangChain integrations. "
+        "It can read/edit files and run tests autonomously."
     ),
     prompt=(
-        "You are an expert Python test engineer. "
-        "Your task is to CD into an integration repository, run `pytest`, "
-        "read the failure output, and fix the source or test code until ALL "
-        "tests pass. Use Bash to run the tests. Use Read/Edit to fix the files. "
-        "Keep trying until tests pass or you conclude it is impossible."
+        _COMMON_FRAMEWORK_PROMPT + 
+        "\nIMPORTANT FRAMEWORK CONTEXT:\n"
+        "LangChain vector stores implement `similarity_search()` and `similarity_search_with_score()`. "
+        "New params should be explicit keyword args with defaults so existing callers are unaffected."
     ),
-    tools=["Read", "Edit", "Bash", "Glob", "Grep"],
-    model=MODEL_SONNET,
+    tools=["Read", "Edit", "Glob", "Grep", "Bash"],
+    model=MODEL_OPUS,
+)
+
+_AGENT_LLAMAINDEX = AgentDefinition(
+    description=(
+        "An expert Python engineer that updates LlamaIndex integrations. "
+        "It can read/edit files and run tests autonomously."
+    ),
+    prompt=(
+        _COMMON_FRAMEWORK_PROMPT + 
+        "\nIMPORTANT FRAMEWORK CONTEXT:\n"
+        "LlamaIndex uses `BasePydanticVectorStore`. The `query()` method takes a `VectorStoreQuery` object. "
+        "New params should also be readable from `query.query_kwargs` so callers can pass them "
+        "without changing the base API."
+    ),
+    tools=["Read", "Edit", "Glob", "Grep", "Bash"],
+    model=MODEL_OPUS,
 )
 
 # ── Master Orchestrator Prompt ─────────────────────────────────────────────
@@ -91,29 +106,28 @@ based on a new upstream Python SDK release.
 {report}
 ─────────────────────────────────────────────────────────────────────────
 
-You have three specialized subagents available via the Task tool:
-1. `analyzer`:    Extracts a concise summary and list of new parameters from the diff.
-2. `transformer`: Edits the integration repos to support the new features.
-3. `healer`:      Runs tests and fixes any breakage.
+You have dedicated subagents available via the Task tool for each framework:
+- `crewai_agent`
+- `langchain_agent`
+- `llamaindex_agent`
 
 INSTRUCTIONS:
-Step 1: Delegate the 'comparison report' to the `analyzer` subagent to get a
-        clear summary of the new parameters and changes.
-        
+Step 1: Read the comparison report above and deduce what the new parameters, types, 
+        and defaults are. Prepare a concise summary of these changes.
+
 Step 2: For EACH integration in scope ({scope_csv}), note its Repo Path and Source Dir:
 {client_contexts}
 
-Step 3: For each integration, delegate a task to the `transformer` subagent:
-        - Provide the analyzer's summary.
-        - Give it the exact Repo Path so it knows where to cd.
-        - Tell it to update the python files in the Source Dir.
+Step 3: For each integration, use the `Task` tool to call the corresponding 
+        subagent (e.g., call `langchain_agent` for the `langchain` integration):
+        - Pass it the summary of upstream changes.
+        - Give it the exact Repo Path and Source Dir so it knows where to work.
+        - Let it autonomously modify the code and run the tests.
         (Do them one by one).
 
-Step 4: Once all integrations are transformed, delegate a task to the `healer`
-        subagent for EACH integration to run `pytest` and fix any failures.
-        Make sure the healer runs from the Repo Path.
+Step 4: Wait for the subagent to report the final pass/fail test status.
 
-Step 5: Summarize the final pass/fail test status for every integration.
+Step 5: Provide a final summary indicating which frameworks succeeded and their test results.
 """
 
 
@@ -125,6 +139,7 @@ def _build_client_contexts(scope: list[str]) -> str:
         src = get_source_dir(client)
         lines.append(
             f"  - Client: {client}\n"
+            f"    Subagent: {client}_agent\n"
             f"    Repo Path: {repo}\n"
             f"    Source Dir: {src.name}"
         )
@@ -183,7 +198,7 @@ async def run_pipeline(
     if notify:
         # Initial greeting without the prefix
         try:
-            notify(f"🚀 *Triggered subagent pipeline* for `{', '.join(targets)}`")
+            notify(f"🚀 *Triggered framework-specific subagent pipeline* for `{', '.join(targets)}`")
         except Exception:
             pass
 
@@ -194,15 +209,18 @@ async def run_pipeline(
     )
 
     agents = {
-        "analyzer": _AGENT_ANALYZER,
-        "transformer": _AGENT_TRANSFORMER,
-        "healer": _AGENT_HEALER,
+        "crewai_agent": _AGENT_CREWAI,
+        "langchain_agent": _AGENT_LANGCHAIN,
+        "llamaindex_agent": _AGENT_LLAMAINDEX,
     }
+
+    # Only provide the configured agents that match the targets in scope
+    active_agents = {k: v for k, v in agents.items() if k.replace("_agent", "") in targets}
 
     try:
         final_summary = await run_orchestrator(
             prompt=prompt,
-            agents=agents,
+            agents=active_agents,
             cwd=base_dir,
             max_turns=100,  # Master agent needs many turns to coordinate all subagents
             on_message=_notify,
